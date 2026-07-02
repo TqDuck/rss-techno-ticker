@@ -19,7 +19,7 @@ namespace MatrixSaver
     //   /s            run full screen on every monitor
     //   /p <hwnd>     render inside the little preview pane in Settings
     //   /c[:<hwnd>]   show the configuration dialog
-    //   /dump <path>  (verification only) render frames headlessly to a PNG
+    //   /dump <path> [theme]  (verification only) render frames headlessly to a PNG
     //   (no args)     run full screen (friendly default when double-clicked)
     static class Program
     {
@@ -47,6 +47,7 @@ namespace MatrixSaver
             if (mode == "dump")
             {
                 string path = args.Length >= 2 ? args[1] : "matrix_dump.png";
+                if (args.Length >= 3) Settings.ThemeKey = args[2];   // harness-only theme override
                 try
                 {
                     using (var eng = new MatrixEngine(960, 600, 16, Feed.FetchSegments()))
@@ -105,12 +106,16 @@ namespace MatrixSaver
         public static List<string> Feeds = new List<string>();
         public static int MaxLen = 0;       // 0 = no cap (full description)
         public static bool Filler = true;   // katakana gibberish in the gaps
+        public static string ThemeKey = "matrix";
+        public static bool Decode = true;   // characters shimmer before settling
 
         public static void Load()
         {
             Feeds = new List<string>();
             MaxLen = 0;
             Filler = true;
+            ThemeKey = "matrix";
+            Decode = true;
             try
             {
                 using (var k = Registry.CurrentUser.OpenSubKey(Key))
@@ -126,6 +131,8 @@ namespace MatrixSaver
                             }
                         object ml = k.GetValue("MaxLen"); if (ml is int) MaxLen = (int)ml;
                         object fl = k.GetValue("Filler"); if (fl is int) Filler = ((int)fl) != 0;
+                        var th = k.GetValue("Theme") as string; if (th != null) ThemeKey = th;
+                        object dc = k.GetValue("Decode"); if (dc is int) Decode = ((int)dc) != 0;
                     }
                 }
             }
@@ -140,6 +147,43 @@ namespace MatrixSaver
                 k.SetValue("Feeds", string.Join("\n", Feeds.ToArray()), RegistryValueKind.String);
                 k.SetValue("MaxLen", MaxLen, RegistryValueKind.DWord);
                 k.SetValue("Filler", Filler ? 1 : 0, RegistryValueKind.DWord);
+                k.SetValue("Theme", ThemeKey, RegistryValueKind.String);
+                k.SetValue("Decode", Decode ? 1 : 0, RegistryValueKind.DWord);
+            }
+        }
+    }
+
+    // ---- Color themes: head flash colour, settled headline colour, filler colour ----
+    class Theme
+    {
+        public readonly string Name;
+        public readonly Color Head, Text, Fill;
+        Theme(string name, Color head, Color text, Color fill)
+        {
+            Name = name; Head = head; Text = text; Fill = fill;
+        }
+
+        public static readonly string[] Keys = { "matrix", "amber", "ice", "ghost", "crimson" };
+
+        public static Theme Get(string key)
+        {
+            switch ((key ?? "").Trim().ToLowerInvariant())
+            {
+                case "amber":
+                    return new Theme("Amber CRT", Color.FromArgb(255, 244, 214),
+                                     Color.FromArgb(255, 176, 0), Color.FromArgb(158, 92, 0));
+                case "ice":
+                    return new Theme("Ice Blue", Color.FromArgb(228, 246, 255),
+                                     Color.FromArgb(90, 195, 255), Color.FromArgb(0, 100, 175));
+                case "ghost":
+                    return new Theme("Ghost White", Color.FromArgb(255, 255, 255),
+                                     Color.FromArgb(204, 208, 216), Color.FromArgb(108, 112, 124));
+                case "crimson":
+                    return new Theme("Crimson", Color.FromArgb(255, 228, 224),
+                                     Color.FromArgb(255, 64, 72), Color.FromArgb(152, 8, 28));
+                default:
+                    return new Theme("Matrix Green", Color.FromArgb(220, 255, 225),
+                                     Color.FromArgb(45, 255, 95), Color.FromArgb(0, 145, 50));
             }
         }
     }
@@ -267,14 +311,17 @@ namespace MatrixSaver
 
     // ---- The render engine: full-width horizontal tickers with Matrix illumination ----
     // Each row owns an endless ribbon (feed segments + gap filler). A bright head
-    // sweeps left-to-right, wrapping forever. The head is white and ramps to green
-    // over a few characters; a translucent black wash then carries green -> black.
+    // sweeps left-to-right, wrapping forever. The head flashes in the theme's head
+    // colour and ramps to the settled colour over a few characters; a translucent
+    // black wash then carries everything toward black.
     //
     // Layout is variable-width: a full-width CJK glyph occupies TWO grid cells, so
     // Japanese/Korean/Chinese line up with half-width Latin/Cyrillic on the same grid.
     class MatrixEngine : IDisposable
     {
         const int Ramp = 4;
+        const int Scramble = 2;      // how many of the newest placements shimmer (decode effect)
+        const double FarDim = 0.58;  // how far toward black the "far" depth tier sits
 
         readonly Random _rng = new Random();
         readonly Bitmap _buffer;
@@ -294,20 +341,28 @@ namespace MatrixSaver
         readonly bool[][] _filler;
         readonly byte[][] _wide;     // cell width per char: 1 or 2
 
-        // Tiny per-row history of the last few placements, so the white->green ramp
-        // can be redrawn at the right columns each frame despite variable widths.
+        // Tiny per-row history of the last few placements, so the head ramp can be
+        // redrawn at the right columns each frame despite variable widths.
         readonly int[][] _hCol;
         readonly char[][] _hCh;
         readonly bool[][] _hFl;
+        readonly byte[][] _hW;
         readonly int[] _hPos;
         readonly int[] _hCnt;
 
         volatile List<string> _pool;
 
+        // Depth: tier 0 rows are the foreground; tier 1 rows are dimmer and slower,
+        // as if the rain continues behind the front layer.
+        readonly bool[] _farRow;
+        readonly bool _decode;
+
         readonly SolidBrush _fade = new SolidBrush(Color.FromArgb(22, 0, 0, 0));
-        readonly SolidBrush _baseText, _baseFill;
-        readonly SolidBrush[] _rampText = new SolidBrush[Ramp];
-        readonly SolidBrush[] _rampFill = new SolidBrush[Ramp];
+        readonly SolidBrush _glow;                                     // head halo
+        readonly SolidBrush[] _baseText = new SolidBrush[2];           // [tier]
+        readonly SolidBrush[] _baseFill = new SolidBrush[2];
+        readonly SolidBrush[][] _rampText = new SolidBrush[2][];       // [tier][depth]
+        readonly SolidBrush[][] _rampFill = new SolidBrush[2][];
 
         public Bitmap Buffer { get { return _buffer; } }
 
@@ -331,16 +386,25 @@ namespace MatrixSaver
             _cols = Math.Max(2, w / _cellW);
             _rows = Math.Max(1, h / _cellH);
 
-            Color white = Color.FromArgb(220, 255, 225);
-            Color textGreen = Color.FromArgb(45, 255, 95);
-            Color fillGreen = Color.FromArgb(0, 145, 50);
-            _baseText = new SolidBrush(textGreen);
-            _baseFill = new SolidBrush(fillGreen);
-            for (int d = 0; d < Ramp; d++)
+            Theme th = Theme.Get(Settings.ThemeKey);
+            _decode = Settings.Decode;
+            _glow = new SolidBrush(Color.FromArgb(58, th.Head));
+            for (int tier = 0; tier < 2; tier++)
             {
-                double t = (double)d / Ramp;     // 0 at head (white) -> base green
-                _rampText[d] = new SolidBrush(Lerp(white, textGreen, t));
-                _rampFill[d] = new SolidBrush(Lerp(white, fillGreen, t));
+                double dim = tier == 0 ? 0.0 : FarDim;
+                Color head = Lerp(th.Head, Color.Black, dim);
+                Color text = Lerp(th.Text, Color.Black, dim);
+                Color fill = Lerp(th.Fill, Color.Black, dim);
+                _baseText[tier] = new SolidBrush(text);
+                _baseFill[tier] = new SolidBrush(fill);
+                _rampText[tier] = new SolidBrush[Ramp];
+                _rampFill[tier] = new SolidBrush[Ramp];
+                for (int d = 0; d < Ramp; d++)
+                {
+                    double t = (double)d / Ramp;     // 0 at head -> settled colour
+                    _rampText[tier][d] = new SolidBrush(Lerp(head, text, t));
+                    _rampFill[tier][d] = new SolidBrush(Lerp(head, fill, t));
+                }
             }
 
             _pos = new double[_rows];
@@ -353,18 +417,23 @@ namespace MatrixSaver
             _hCol = new int[_rows][];
             _hCh = new char[_rows][];
             _hFl = new bool[_rows][];
+            _hW = new byte[_rows][];
             _hPos = new int[_rows];
             _hCnt = new int[_rows];
+            _farRow = new bool[_rows];
             for (int r = 0; r < _rows; r++)
             {
                 BuildRibbon(r);
-                _speed[r] = 0.40 + _rng.NextDouble() * 1.05;
+                _farRow[r] = _rng.NextDouble() < 0.35;
+                _speed[r] = _farRow[r] ? 0.16 + _rng.NextDouble() * 0.38
+                                       : 0.40 + _rng.NextDouble() * 1.05;
                 _pos[r] = _rng.Next(0, Math.Max(1, _ribbon[r].Length));
                 _idx[r] = (int)Math.Floor(_pos[r]);
                 _cursor[r] = _rng.Next(0, _cols);
                 _hCol[r] = new int[Ramp];
                 _hCh[r] = new char[Ramp];
                 _hFl[r] = new bool[Ramp];
+                _hW[r] = new byte[Ramp];
             }
         }
 
@@ -484,12 +553,20 @@ namespace MatrixSaver
 
         static int Mod(int a, int n) { int m = a % n; return m < 0 ? m + n : m; }
 
-        void PushHist(int r, int col, char ch, bool fl)
+        void PushHist(int r, int col, char ch, bool fl, byte w)
         {
             int p = _hPos[r];
-            _hCol[r][p] = col; _hCh[r][p] = ch; _hFl[r][p] = fl;
+            _hCol[r][p] = col; _hCh[r][p] = ch; _hFl[r][p] = fl; _hW[r][p] = w;
             _hPos[r] = Mod(p + 1, Ramp);
             if (_hCnt[r] < Ramp) _hCnt[r]++;
+        }
+
+        // Decode shimmer: a random stand-in glyph shown while a placement is still
+        // "resolving". Width must match so the grid doesn't wobble.
+        char ScrambleGlyph(int wcells)
+        {
+            if (wcells == 2) return (char)(0x30A1 + _rng.Next(0, 0x30FA - 0x30A1 + 1)); // full-width katakana
+            return Gib();
         }
 
         public void Step()
@@ -505,8 +582,9 @@ namespace MatrixSaver
                 byte[] wid = _wide[r];
                 int L = rib.Length;
                 float y = r * _cellH;
+                int tier = _farRow[r] ? 1 : 0;
 
-                // Commit each newly reached character at its settled green, advancing
+                // Commit each newly reached character at its settled colour, advancing
                 // the column cursor by the character's width and wrapping at the edge.
                 while (_idx[r] < target)
                 {
@@ -520,21 +598,37 @@ namespace MatrixSaver
                     {
                         int wcells = wid[ci];
                         if (_cursor[r] + wcells > _cols) _cursor[r] = 0;   // don't straddle the edge
-                        DrawGlyph(ch, mask[ci] ? _baseFill : _baseText, _cursor[r] * _cellW, y);
-                        PushHist(r, _cursor[r], ch, mask[ci]);
+                        DrawGlyph(ch, mask[ci] ? _baseFill[tier] : _baseText[tier], _cursor[r] * _cellW, y);
+                        PushHist(r, _cursor[r], ch, mask[ci], (byte)wcells);
                         _cursor[r] += wcells;
                         if (_cursor[r] >= _cols) _cursor[r] = 0;
                     }
                     _idx[r]++;
                 }
 
-                // Redraw the last few placements as a white -> green ramp (the head glow).
+                // Redraw the last few placements as a bright head ramp. Each cell is
+                // erased first because the decode shimmer can show a DIFFERENT glyph
+                // than the one committed underneath.
                 int cnt = _hCnt[r];
                 for (int d = 0; d < cnt && d < Ramp; d++)
                 {
                     int p = Mod(_hPos[r] - 1 - d, Ramp);
-                    char ch = _hCh[r][p];
-                    DrawGlyph(ch, _hFl[r][p] ? _rampFill[d] : _rampText[d], _hCol[r][p] * _cellW, y);
+                    int wcells = _hW[r][p];
+                    float x = _hCol[r][p] * _cellW;
+                    _g.FillRectangle(Brushes.Black, x, y, wcells * _cellW, _cellH);
+
+                    char ch = (_decode && d < Scramble) ? ScrambleGlyph(wcells) : _hCh[r][p];
+                    Brush b = _hFl[r][p] ? _rampFill[tier][d] : _rampText[tier][d];
+
+                    if (d == 0 && tier == 0)
+                    {
+                        // Cheap bloom: a dim 1px halo behind the head glyph.
+                        DrawGlyph(ch, _glow, x - 1, y);
+                        DrawGlyph(ch, _glow, x + 1, y);
+                        DrawGlyph(ch, _glow, x, y - 1);
+                        DrawGlyph(ch, _glow, x, y + 1);
+                    }
+                    DrawGlyph(ch, b, x, y);
                 }
             }
         }
@@ -549,9 +643,13 @@ namespace MatrixSaver
             _fontKR.Dispose();
             _fontRTL.Dispose();
             _fade.Dispose();
-            _baseText.Dispose();
-            _baseFill.Dispose();
-            for (int d = 0; d < Ramp; d++) { _rampText[d].Dispose(); _rampFill[d].Dispose(); }
+            _glow.Dispose();
+            for (int tier = 0; tier < 2; tier++)
+            {
+                _baseText[tier].Dispose();
+                _baseFill[tier].Dispose();
+                for (int d = 0; d < Ramp; d++) { _rampText[tier][d].Dispose(); _rampFill[tier][d].Dispose(); }
+            }
         }
     }
 
@@ -716,6 +814,8 @@ namespace MatrixSaver
         readonly ListBox _feeds = new ListBox();
         readonly NumericUpDown _maxLen = new NumericUpDown();
         readonly CheckBox _filler = new CheckBox();
+        readonly ComboBox _theme = new ComboBox();
+        readonly CheckBox _decode = new CheckBox();
 
         public ConfigForm()
         {
@@ -724,7 +824,7 @@ namespace MatrixSaver
             StartPosition = FormStartPosition.CenterScreen;
             MaximizeBox = false;
             MinimizeBox = false;
-            ClientSize = new Size(460, 380);
+            ClientSize = new Size(460, 452);
 
             Controls.Add(new Label { Text = "RSS feeds (mix in other languages for an all-text Matrix):",
                                      Location = new Point(12, 10), AutoSize = true });
@@ -766,7 +866,23 @@ namespace MatrixSaver
             _filler.Checked = Settings.Filler;
             Controls.Add(_filler);
 
-            var ok = new Button { Text = "OK", Location = new Point(268, 336), Size = new Size(80, 28),
+            Controls.Add(new Label { Text = "Color theme:",
+                                     Location = new Point(12, 316), AutoSize = true });
+            _theme.Location = new Point(250, 312);
+            _theme.Size = new Size(198, 24);
+            _theme.DropDownStyle = ComboBoxStyle.DropDownList;
+            foreach (var key in Theme.Keys) _theme.Items.Add(Theme.Get(key).Name);
+            int sel = Array.IndexOf(Theme.Keys, (Settings.ThemeKey ?? "matrix").Trim().ToLowerInvariant());
+            _theme.SelectedIndex = sel >= 0 ? sel : 0;
+            Controls.Add(_theme);
+
+            _decode.Text = "Decode effect (characters shimmer before settling).";
+            _decode.Location = new Point(12, 348);
+            _decode.AutoSize = true;
+            _decode.Checked = Settings.Decode;
+            Controls.Add(_decode);
+
+            var ok = new Button { Text = "OK", Location = new Point(268, 408), Size = new Size(80, 28),
                                   DialogResult = DialogResult.OK };
             ok.Click += (s, e) =>
             {
@@ -774,12 +890,14 @@ namespace MatrixSaver
                 foreach (var it in _feeds.Items) Settings.Feeds.Add(it.ToString());
                 Settings.MaxLen = (int)_maxLen.Value;
                 Settings.Filler = _filler.Checked;
+                Settings.ThemeKey = Theme.Keys[Math.Max(0, _theme.SelectedIndex)];
+                Settings.Decode = _decode.Checked;
                 try { Settings.Save(); } catch (Exception ex) { MessageBox.Show("Could not save: " + ex.Message); }
                 Close();
             };
             Controls.Add(ok);
 
-            var cancel = new Button { Text = "Cancel", Location = new Point(356, 336), Size = new Size(80, 28),
+            var cancel = new Button { Text = "Cancel", Location = new Point(356, 408), Size = new Size(80, 28),
                                       DialogResult = DialogResult.Cancel };
             cancel.Click += (s, e) => Close();
             Controls.Add(cancel);

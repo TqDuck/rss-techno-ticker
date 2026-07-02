@@ -3,10 +3,11 @@
 **A native Windows screensaver that turns RSS feeds into a wall of Matrix-style tickers.**
 
 Every screen row is an endless ribbon of real headlines — `TITLE :: DESCRIPTION` —
-scrolling left-to-right and wrapping forever. Each character ignites **white**,
-settles to **green**, and fades to **black** behind the writing head, just like
-the digital rain. Optional katakana gibberish fills the gaps between stories for
-the classic Matrix texture.
+scrolling left-to-right and wrapping forever. Each character **shimmers through
+random glyphs** as it decodes, ignites **white**, settles to **green**, and fades
+to **black** behind the writing head, just like the digital rain. Dim, slow rows
+drift behind the bright ones for a sense of depth. Optional katakana gibberish
+fills the gaps between stories for the classic Matrix texture.
 
 ![English feed with katakana filler](preview.png)
 
@@ -27,8 +28,14 @@ glyphs take two cells):
 - **Bring your own feeds** — RSS 2.0 *and* Atom. Feeds are fetched in parallel
   with a browser User-Agent; a slow or dead feed never blocks the others. Offline?
   A baked-in fallback keeps the rain falling.
+- **Five color themes** — Matrix Green, Amber CRT, Ice Blue, Ghost White, Crimson.
+- **Decode effect** — each new character flickers through random glyphs for a few
+  frames before resolving into the real letter (toggleable).
+- **Depth layers** — about a third of the rows run dimmer and slower, like rain
+  falling further back; the foreground heads get a subtle glow.
 - **Settings dialog** — add/remove feed URLs, cap or uncap description length,
-  toggle the katakana filler. Stored under `HKCU\Software\MatrixRain`.
+  toggle the katakana filler, pick a theme, toggle the decode effect. Stored
+  under `HKCU\Software\MatrixRain`.
 - **Wide language support** — see below. A curated list of verified feeds in a
   dozen languages lives in [FEEDS.md](FEEDS.md).
 
@@ -79,16 +86,17 @@ A `.scr` is an ordinary `.exe` that Windows invokes with a flag:
 | `/s` | Run full screen on every monitor |
 | `/p <hwnd>` | Render the preview thumbnail inside Screen Saver Settings |
 | `/c` | Show the configuration dialog |
-| `/dump <path>` | Render frames headlessly to a PNG (build verification / screenshots) |
+| `/dump <path> [theme]` | Render frames headlessly to a PNG (build verification / screenshots) |
 
 Note: the `.scr` file association hijacks command-line arguments — to use `/dump`,
 copy the file to a `.exe` name and invoke that directly.
 
 ## Tweaking the rendering (edit `MatrixRain.cs`, rebuild)
-- **Colors** — `white` / `textGreen` / `fillGreen` in the `MatrixEngine` constructor.
+- **Theme colors** — the palette table in `Theme.Get` (head flash / settled text / filler).
 - **Trail length** — the alpha of `_fade` (lower = longer-lived text).
-- **Head glow length** — the `Ramp` constant.
-- **Sweep speed** — the `_speed[r]` range in the constructor.
+- **Head ramp length** — the `Ramp` constant; **shimmer duration** — `Scramble`.
+- **Depth** — `FarDim` (how dark the far tier is) and the `0.35` far-row fraction.
+- **Sweep speed** — the `_speed[r]` ranges in the constructor.
 - **Text size** — `fontSize` in `MatrixForm.OnLoad` (18 full-screen, 11 preview).
 
 ## License
