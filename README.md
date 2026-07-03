@@ -33,9 +33,13 @@ glyphs take two cells):
   frames before resolving into the real letter (toggleable).
 - **Depth layers** — about a third of the rows run dimmer and slower, like rain
   falling further back; the foreground heads get a subtle glow.
-- **Settings dialog** — add/remove feed URLs, cap or uncap description length,
+- **Settings dialog** — add/remove feed URLs, **Test all** to health-check every
+  feed (item count or the exact failure), cap or uncap description length,
   toggle the katakana filler, pick a theme, toggle the decode effect. Stored
   under `HKCU\Software\MatrixRain`.
+- **Fast** — a glyph atlas cache means each (character, style) pair is rasterized
+  once and blitted ever after; frame time is decoupled from timer jitter, and
+  feeds silently re-fetch every 10 minutes so overnight sessions show fresh news.
 - **Wide language support** — see below. A curated list of verified feeds in a
   dozen languages lives in [FEEDS.md](FEEDS.md).
 
@@ -86,7 +90,7 @@ A `.scr` is an ordinary `.exe` that Windows invokes with a flag:
 | `/s` | Run full screen on every monitor |
 | `/p <hwnd>` | Render the preview thumbnail inside Screen Saver Settings |
 | `/c` | Show the configuration dialog |
-| `/dump <path> [theme]` | Render frames headlessly to a PNG (build verification / screenshots) |
+| `/dump <path> [theme] [feedUrl]` | Render frames headlessly to a PNG (build verification / screenshots); writes a `.timing.txt` sidecar with the frame time |
 
 Note: the `.scr` file association hijacks command-line arguments — to use `/dump`,
 copy the file to a `.exe` name and invoke that directly.

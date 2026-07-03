@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.IO;
@@ -19,7 +20,7 @@ namespace MatrixSaver
     //   /s            run full screen on every monitor
     //   /p <hwnd>     render inside the little preview pane in Settings
     //   /c[:<hwnd>]   show the configuration dialog
-    //   /dump <path> [theme]  (verification only) render frames headlessly to a PNG
+    //   /dump <path> [theme] [feedUrl]  (verification only) render frames to a PNG
     //   (no args)     run full screen (friendly default when double-clicked)
     static class Program
     {
@@ -47,13 +48,19 @@ namespace MatrixSaver
             if (mode == "dump")
             {
                 string path = args.Length >= 2 ? args[1] : "matrix_dump.png";
-                if (args.Length >= 3) Settings.ThemeKey = args[2];   // harness-only theme override
+                if (args.Length >= 3) Settings.ThemeKey = args[2];   // harness-only overrides
+                if (args.Length >= 4) Settings.Feeds = new List<string> { args[3] };
                 try
                 {
                     using (var eng = new MatrixEngine(960, 600, 16, Feed.FetchSegments()))
                     {
+                        var sw = System.Diagnostics.Stopwatch.StartNew();
                         for (int i = 0; i < 260; i++) eng.Step();
+                        sw.Stop();
                         eng.Buffer.Save(path, ImageFormat.Png);
+                        File.WriteAllText(path + ".timing.txt", string.Format(
+                            "260 frames in {0} ms ({1:0.00} ms/frame)",
+                            sw.ElapsedMilliseconds, sw.ElapsedMilliseconds / 260.0));
                     }
                 }
                 catch (Exception ex)
@@ -309,6 +316,98 @@ namespace MatrixSaver
         }
     }
 
+    // ---- Glyph atlas cache ----
+    // GDI+ DrawString rasterizes the outline on every call and is the frame's hot
+    // path. Instead, each distinct (character, style) pair is drawn ONCE into a
+    // shared sheet bitmap — RTL rotation baked in — and every frame after that is
+    // a plain 1:1 blit. Sheets grow on demand via a simple shelf packer.
+    class GlyphCache : IDisposable
+    {
+        const int SheetW = 1024, SheetH = 512;
+        const int Bleed = 4;    // margin captured around the cell so antialiasing
+                                // and descender overhang survive the copy
+
+        struct Slot { public int Sheet, X, Y, W, H; }
+
+        readonly Dictionary<int, Slot> _slots = new Dictionary<int, Slot>();
+        readonly List<Bitmap> _sheets = new List<Bitmap>();
+        readonly int _cellW, _cellH;
+        Graphics _sg;               // draws into the newest sheet
+        int _x, _y, _rowH;
+
+        public GlyphCache(int cellW, int cellH) { _cellW = cellW; _cellH = cellH; }
+
+        public void Draw(Graphics g, char ch, int style, Font font, bool rtl, Brush brush,
+                         int x, int y, int wcells)
+        {
+            int key = ch | (style << 16);
+            Slot s;
+            if (!_slots.TryGetValue(key, out s)) s = Rasterize(key, ch, font, rtl, brush, wcells);
+            g.DrawImage(_sheets[s.Sheet], new Rectangle(x - Bleed, y - Bleed, s.W, s.H),
+                        s.X, s.Y, s.W, s.H, GraphicsUnit.Pixel);
+        }
+
+        Slot Rasterize(int key, char ch, Font font, bool rtl, Brush brush, int wcells)
+        {
+            int w = wcells * _cellW + 2 * Bleed, h = _cellH + 2 * Bleed;
+            if (_sheets.Count == 0) NewSheet();
+            if (_x + w > SheetW) { _x = 0; _y += _rowH; _rowH = 0; }
+            if (_y + h > SheetH) NewSheet();
+            if (h > _rowH) _rowH = h;
+
+            float gx = _x + Bleed, gy = _y + Bleed;   // cell origin inside the slot
+            if (rtl)
+            {
+                // Rotate 180° about the cell centre (see IsRtl for why).
+                float cx = gx + _cellW * 0.5f, cy = gy + _cellH * 0.5f;
+                var st = _sg.Save();
+                _sg.TranslateTransform(cx, cy);
+                _sg.RotateTransform(180f);
+                _sg.TranslateTransform(-cx, -cy);
+                _sg.DrawString(ch.ToString(), font, brush, gx, gy);
+                _sg.Restore(st);
+            }
+            else
+            {
+                _sg.DrawString(ch.ToString(), font, brush, gx, gy);
+            }
+
+            var s = new Slot { Sheet = _sheets.Count - 1, X = _x, Y = _y, W = w, H = h };
+            _slots[key] = s;
+            _x += w;
+            return s;
+        }
+
+        const int MaxSheets = 24;   // ~24 MB; a huge CJK vocabulary can't grow unbounded
+
+        void NewSheet()
+        {
+            if (_sg != null) _sg.Dispose();
+            if (_sheets.Count >= MaxSheets)
+            {
+                // Start over; live glyphs re-rasterize on demand over the next frames.
+                foreach (var b in _sheets) b.Dispose();
+                _sheets.Clear();
+                _slots.Clear();
+            }
+            // Premultiplied alpha is the GDI+ fast path — anything else forces a
+            // per-pixel conversion on every single DrawImage.
+            var bmp = new Bitmap(SheetW, SheetH, PixelFormat.Format32bppPArgb);
+            _sheets.Add(bmp);
+            _sg = Graphics.FromImage(bmp);
+            _sg.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            _x = 0; _y = 0; _rowH = 0;
+        }
+
+        public void Dispose()
+        {
+            if (_sg != null) _sg.Dispose();
+            foreach (var b in _sheets) b.Dispose();
+            _sheets.Clear();
+            _slots.Clear();
+        }
+    }
+
     // ---- The render engine: full-width horizontal tickers with Matrix illumination ----
     // Each row owns an endless ribbon (feed segments + gap filler). A bright head
     // sweeps left-to-right, wrapping forever. The head flashes in the theme's head
@@ -323,9 +422,14 @@ namespace MatrixSaver
         const int Scramble = 2;      // how many of the newest placements shimmer (decode effect)
         const double FarDim = 0.58;  // how far toward black the "far" depth tier sits
 
+        // Glyph-cache style ids: tier*10 + {0 text, 1 fill, 2..5 rampText, 6..9 rampFill};
+        // 20 = glow. A style is just "which brush", so cached pixels can be reused.
+        const int StyleGlow = 20;
+
         readonly Random _rng = new Random();
         readonly Bitmap _buffer;
         readonly Graphics _g;
+        readonly GlyphCache _cache;
         readonly Font _font;     // MS Gothic: Latin, Cyrillic, kana, most CJK Han
         readonly Font _fontKR;   // Malgun Gothic: Korean Hangul (MS Gothic lacks it)
         readonly Font _fontRTL;  // Tahoma: Hebrew / Arabic / Persian
@@ -372,10 +476,15 @@ namespace MatrixSaver
             h = Math.Max(1, h);
             _pool = (pool != null && pool.Count > 0) ? pool : new List<string>(Feed.Fallback);
 
-            _buffer = new Bitmap(w, h);
+            _buffer = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
             _g = Graphics.FromImage(_buffer);
             _g.Clear(Color.Black);
             _g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            // All glyphs arrive as 1:1 atlas blits — make DrawImage pixel-exact
+            // and keep it on the premultiplied fast path.
+            _g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            _g.PixelOffsetMode = PixelOffsetMode.Half;
+            _g.CompositingQuality = CompositingQuality.HighSpeed;
 
             _font = new Font("MS Gothic", fontSize, FontStyle.Bold, GraphicsUnit.Pixel);
             _fontKR = new Font("Malgun Gothic", fontSize, FontStyle.Bold, GraphicsUnit.Pixel);
@@ -385,6 +494,7 @@ namespace MatrixSaver
             _cellH = Math.Max(1, (int)Math.Ceiling(_font.GetHeight(_g) * 1.18));
             _cols = Math.Max(2, w / _cellW);
             _rows = Math.Max(1, h / _cellH);
+            _cache = new GlyphCache(_cellW, _cellH);
 
             Theme th = Theme.Get(Settings.ThemeKey);
             _decode = Settings.Decode;
@@ -523,24 +633,11 @@ namespace MatrixSaver
                    (c >= 0xFE70 && c <= 0xFEFF);    // Arabic presentation forms B
         }
 
-        // Draw one glyph; RTL glyphs are rotated 180° about their cell centre.
-        void DrawGlyph(char ch, Brush b, float x, float y)
+        // Draw one glyph via the atlas cache; RTL rotation is baked into the cached
+        // pixels, so runtime cost is a single blit regardless of script.
+        void DrawGlyph(char ch, int style, Brush b, int x, int y, int wcells)
         {
-            Font f = FontFor(ch);
-            if (IsRtl(ch))
-            {
-                float cx = x + _cellW * 0.5f, cy = y + _cellH * 0.5f;
-                var st = _g.Save();
-                _g.TranslateTransform(cx, cy);
-                _g.RotateTransform(180f);
-                _g.TranslateTransform(-cx, -cy);
-                _g.DrawString(ch.ToString(), f, b, x, y);
-                _g.Restore(st);
-            }
-            else
-            {
-                _g.DrawString(ch.ToString(), f, b, x, y);
-            }
+            _cache.Draw(_g, ch, style, FontFor(ch), IsRtl(ch), b, x, y, wcells);
         }
 
         static Color Lerp(Color a, Color b, double t)
@@ -569,19 +666,25 @@ namespace MatrixSaver
             return Gib();
         }
 
-        public void Step()
+        public void Step() { Step(1.0); }
+
+        // dt is in "frames" (1.0 = the nominal 33 ms tick). A late timer tick passes
+        // dt > 1 so the rain covers the same distance it would have at full rate.
+        public void Step(double dt)
         {
-            _g.FillRectangle(_fade, 0, 0, _buffer.Width, _buffer.Height); // green -> black
+            int fa = (int)Math.Round(22 * dt);               // fade keeps pace with time
+            _fade.Color = Color.FromArgb(Math.Max(4, Math.Min(70, fa)), 0, 0, 0);
+            _g.FillRectangle(_fade, 0, 0, _buffer.Width, _buffer.Height);
 
             for (int r = 0; r < _rows; r++)
             {
-                _pos[r] += _speed[r];
+                _pos[r] += _speed[r] * dt;
                 int target = (int)Math.Floor(_pos[r]);
                 string rib = _ribbon[r];
                 bool[] mask = _filler[r];
                 byte[] wid = _wide[r];
                 int L = rib.Length;
-                float y = r * _cellH;
+                int y = r * _cellH;
                 int tier = _farRow[r] ? 1 : 0;
 
                 // Commit each newly reached character at its settled colour, advancing
@@ -598,7 +701,9 @@ namespace MatrixSaver
                     {
                         int wcells = wid[ci];
                         if (_cursor[r] + wcells > _cols) _cursor[r] = 0;   // don't straddle the edge
-                        DrawGlyph(ch, mask[ci] ? _baseFill[tier] : _baseText[tier], _cursor[r] * _cellW, y);
+                        DrawGlyph(ch, tier * 10 + (mask[ci] ? 1 : 0),
+                                  mask[ci] ? _baseFill[tier] : _baseText[tier],
+                                  _cursor[r] * _cellW, y, wcells);
                         PushHist(r, _cursor[r], ch, mask[ci], (byte)wcells);
                         _cursor[r] += wcells;
                         if (_cursor[r] >= _cols) _cursor[r] = 0;
@@ -614,21 +719,22 @@ namespace MatrixSaver
                 {
                     int p = Mod(_hPos[r] - 1 - d, Ramp);
                     int wcells = _hW[r][p];
-                    float x = _hCol[r][p] * _cellW;
+                    int x = _hCol[r][p] * _cellW;
                     _g.FillRectangle(Brushes.Black, x, y, wcells * _cellW, _cellH);
 
                     char ch = (_decode && d < Scramble) ? ScrambleGlyph(wcells) : _hCh[r][p];
+                    int style = tier * 10 + (_hFl[r][p] ? 6 : 2) + d;
                     Brush b = _hFl[r][p] ? _rampFill[tier][d] : _rampText[tier][d];
 
                     if (d == 0 && tier == 0)
                     {
                         // Cheap bloom: a dim 1px halo behind the head glyph.
-                        DrawGlyph(ch, _glow, x - 1, y);
-                        DrawGlyph(ch, _glow, x + 1, y);
-                        DrawGlyph(ch, _glow, x, y - 1);
-                        DrawGlyph(ch, _glow, x, y + 1);
+                        DrawGlyph(ch, StyleGlow, _glow, x - 1, y, wcells);
+                        DrawGlyph(ch, StyleGlow, _glow, x + 1, y, wcells);
+                        DrawGlyph(ch, StyleGlow, _glow, x, y - 1, wcells);
+                        DrawGlyph(ch, StyleGlow, _glow, x, y + 1, wcells);
                     }
-                    DrawGlyph(ch, b, x, y);
+                    DrawGlyph(ch, style, b, x, y, wcells);
                 }
             }
         }
@@ -637,6 +743,7 @@ namespace MatrixSaver
 
         public void Dispose()
         {
+            _cache.Dispose();
             _g.Dispose();
             _buffer.Dispose();
             _font.Dispose();
@@ -674,6 +781,9 @@ namespace MatrixSaver
         readonly IntPtr _parent;
         MatrixEngine _engine;
         System.Windows.Forms.Timer _timer;
+        System.Windows.Forms.Timer _refresh;
+        readonly System.Diagnostics.Stopwatch _clock = new System.Diagnostics.Stopwatch();
+        long _lastMs;
 
         public MatrixForm(Rectangle bounds)
         {
@@ -729,27 +839,18 @@ namespace MatrixSaver
 
             if (!_preview)
             {
-                // Fetch every feed on its own thread and merge each into the pool as it
-                // arrives, so a slow / dead / blocked feed can't starve the others.
-                var bag = new List<string>();
-                object gate = new object();
-                foreach (string url in Settings.Feeds)
-                {
-                    string u = url;
-                    var t = new Thread(() =>
-                    {
-                        var part = new List<string>();
-                        try { Feed.FetchOne(u, part); } catch { }
-                        if (part.Count == 0) return;
-                        List<string> snapshot;
-                        lock (gate) { bag.AddRange(part); snapshot = new List<string>(bag); }
-                        try { BeginInvoke((Action)(() => { if (_engine != null) _engine.SetPool(snapshot); })); }
-                        catch { }
-                    });
-                    t.IsBackground = true;
-                    t.Start();
-                }
+                FetchFeedsAsync();
+
+                // Long sessions get fresh headlines: re-fetch every feed periodically
+                // and swap the whole pool for that round's results.
+                _refresh = new System.Windows.Forms.Timer();
+                _refresh.Interval = 10 * 60 * 1000;
+                _refresh.Tick += (s, ev) => FetchFeedsAsync();
+                _refresh.Start();
             }
+
+            _clock.Start();
+            _lastMs = 0;
 
             _timer = new System.Windows.Forms.Timer();
             _timer.Interval = 33; // ~30 fps
@@ -758,10 +859,43 @@ namespace MatrixSaver
                 // In preview mode, exit once the Settings pane (our parent) is gone —
                 // otherwise the preview process leaks every time Settings refreshes.
                 if (_preview && !IsWindow(_parent)) { Close(); return; }
-                _engine.Step();
+
+                // WinForms timers drift and stall; scale each step by real elapsed
+                // time so the rain's speed doesn't depend on timer health.
+                long now = _clock.ElapsedMilliseconds;
+                double dt = (now - _lastMs) / 33.3;
+                _lastMs = now;
+                if (dt <= 0) dt = 1;
+                if (dt > 3) dt = 3;      // after a long stall, don't dump a flood of glyphs
+
+                _engine.Step(dt);
                 Invalidate();
             };
             _timer.Start();
+        }
+
+        // Fetch every feed on its own thread and merge each into the pool as it
+        // arrives, so a slow / dead / blocked feed can't starve the others.
+        void FetchFeedsAsync()
+        {
+            var bag = new List<string>();
+            object gate = new object();
+            foreach (string url in Settings.Feeds)
+            {
+                string u = url;
+                var t = new Thread(() =>
+                {
+                    var part = new List<string>();
+                    try { Feed.FetchOne(u, part); } catch { }
+                    if (part.Count == 0) return;
+                    List<string> snapshot;
+                    lock (gate) { bag.AddRange(part); snapshot = new List<string>(bag); }
+                    try { BeginInvoke((Action)(() => { if (_engine != null) _engine.SetPool(snapshot); })); }
+                    catch { }
+                });
+                t.IsBackground = true;
+                t.Start();
+            }
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -793,6 +927,7 @@ namespace MatrixSaver
             if (disposing)
             {
                 if (_timer != null) _timer.Dispose();
+                if (_refresh != null) _refresh.Dispose();
                 if (_engine != null) _engine.Dispose();
             }
             base.Dispose(disposing);
@@ -849,6 +984,48 @@ namespace MatrixSaver
                 if (_feeds.SelectedIndex >= 0) _feeds.Items.RemoveAt(_feeds.SelectedIndex);
             };
             Controls.Add(remove);
+
+            var test = new Button { Text = "Test all", Location = new Point(188, 198), Size = new Size(80, 26) };
+            test.Click += (s, e) =>
+            {
+                var urls = new List<string>();
+                foreach (var it in _feeds.Items) urls.Add(it.ToString());
+                if (urls.Count == 0) { MessageBox.Show(this, "No feeds to test."); return; }
+
+                test.Enabled = false;
+                test.Text = "Testing...";
+                var t = new Thread(() =>
+                {
+                    var sb = new StringBuilder();
+                    foreach (string u in urls)
+                    {
+                        var part = new List<string>();
+                        bool healthy; string status;
+                        try
+                        {
+                            Feed.FetchOne(u, part);
+                            healthy = part.Count > 0;
+                            status = healthy ? part.Count + " items" : "fetched, but no items found";
+                        }
+                        catch (Exception ex) { healthy = false; status = ex.Message; }
+                        sb.AppendLine((healthy ? "[ OK ]  " : "[FAIL]  ") + u);
+                        sb.AppendLine("            " + status);
+                    }
+                    try
+                    {
+                        BeginInvoke((Action)(() =>
+                        {
+                            test.Enabled = true;
+                            test.Text = "Test all";
+                            MessageBox.Show(this, sb.ToString(), "Feed health");
+                        }));
+                    }
+                    catch { }
+                });
+                t.IsBackground = true;
+                t.Start();
+            };
+            Controls.Add(test);
 
             Controls.Add(new Label { Text = "Max description length (0 = full):",
                                      Location = new Point(12, 244), AutoSize = true });
