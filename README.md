@@ -31,12 +31,17 @@ glyphs take two cells):
 - **Five color themes** — Matrix Green, Amber CRT, Ice Blue, Ghost White, Crimson.
 - **Decode effect** — each new character flickers through random glyphs for a few
   frames before resolving into the real letter (toggleable).
-- **Depth layers** — about a third of the rows run dimmer and slower, like rain
-  falling further back; the foreground heads get a subtle glow.
+- **Depth layers** — three tiers of rows: bright fast foreground, mid-ground, and
+  dim slow background rain, for a layered parallax feel.
+- **Phosphor bloom** — foreground heads carry a soft baked-in glow halo (free at
+  runtime — it lives in the glyph cache).
+- **A clock in the rain** — at the top of each minute, HH:MM scramble-decodes at
+  screen centre, glows in the theme colour for a few seconds, then dissolves back
+  into the fade (toggleable).
 - **Settings dialog** — add/remove feed URLs, **Test all** to health-check every
   feed (item count or the exact failure), cap or uncap description length,
-  toggle the katakana filler, pick a theme, toggle the decode effect. Stored
-  under `HKCU\Software\MatrixRain`.
+  toggle the katakana filler, pick a theme, toggle the decode effect and the
+  clock. Stored under `HKCU\Software\MatrixRain`.
 - **Fast** — a glyph atlas cache means each (character, style) pair is rasterized
   once and blitted ever after; frame time is decoupled from timer jitter, and
   feeds silently re-fetch every 10 minutes so overnight sessions show fresh news.
@@ -90,7 +95,7 @@ A `.scr` is an ordinary `.exe` that Windows invokes with a flag:
 | `/s` | Run full screen on every monitor |
 | `/p <hwnd>` | Render the preview thumbnail inside Screen Saver Settings |
 | `/c` | Show the configuration dialog |
-| `/dump <path> [theme] [feedUrl]` | Render frames headlessly to a PNG (build verification / screenshots); writes a `.timing.txt` sidecar with the frame time |
+| `/dump <path> [theme] [feedUrl\|-] [clock]` | Render frames headlessly to a PNG (build verification / screenshots); writes a `.timing.txt` sidecar with the frame time; `clock` forces the clock visible |
 
 Note: the `.scr` file association hijacks command-line arguments — to use `/dump`,
 copy the file to a `.exe` name and invoke that directly.
@@ -99,7 +104,8 @@ copy the file to a `.exe` name and invoke that directly.
 - **Theme colors** — the palette table in `Theme.Get` (head flash / settled text / filler).
 - **Trail length** — the alpha of `_fade` (lower = longer-lived text).
 - **Head ramp length** — the `Ramp` constant; **shimmer duration** — `Scramble`.
-- **Depth** — `FarDim` (how dark the far tier is) and the `0.35` far-row fraction.
+- **Depth** — the `TierDim` table (how dark each tier is) and the 40/30/30 tier
+  split in the constructor; **bloom strength** — the `_glow` alpha.
 - **Sweep speed** — the `_speed[r]` ranges in the constructor.
 - **Text size** — `fontSize` in `MatrixForm.OnLoad` (18 full-screen, 11 preview).
 

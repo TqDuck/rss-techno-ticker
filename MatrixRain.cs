@@ -20,7 +20,7 @@ namespace MatrixSaver
     //   /s            run full screen on every monitor
     //   /p <hwnd>     render inside the little preview pane in Settings
     //   /c[:<hwnd>]   show the configuration dialog
-    //   /dump <path> [theme] [feedUrl]  (verification only) render frames to a PNG
+    //   /dump <path> [theme] [feedUrl|-] [clock]  (verification only) render to a PNG
     //   (no args)     run full screen (friendly default when double-clicked)
     static class Program
     {
@@ -49,11 +49,12 @@ namespace MatrixSaver
             {
                 string path = args.Length >= 2 ? args[1] : "matrix_dump.png";
                 if (args.Length >= 3) Settings.ThemeKey = args[2];   // harness-only overrides
-                if (args.Length >= 4) Settings.Feeds = new List<string> { args[3] };
+                if (args.Length >= 4 && args[3] != "-") Settings.Feeds = new List<string> { args[3] };
                 try
                 {
                     using (var eng = new MatrixEngine(960, 600, 16, Feed.FetchSegments()))
                     {
+                        if (args.Length >= 5 && args[4] == "clock") eng.ForceClock = true;
                         var sw = System.Diagnostics.Stopwatch.StartNew();
                         for (int i = 0; i < 260; i++) eng.Step();
                         sw.Stop();
@@ -115,6 +116,7 @@ namespace MatrixSaver
         public static bool Filler = true;   // katakana gibberish in the gaps
         public static string ThemeKey = "matrix";
         public static bool Decode = true;   // characters shimmer before settling
+        public static bool Clock = true;    // HH:MM materializes each minute
 
         public static void Load()
         {
@@ -123,6 +125,7 @@ namespace MatrixSaver
             Filler = true;
             ThemeKey = "matrix";
             Decode = true;
+            Clock = true;
             try
             {
                 using (var k = Registry.CurrentUser.OpenSubKey(Key))
@@ -140,6 +143,7 @@ namespace MatrixSaver
                         object fl = k.GetValue("Filler"); if (fl is int) Filler = ((int)fl) != 0;
                         var th = k.GetValue("Theme") as string; if (th != null) ThemeKey = th;
                         object dc = k.GetValue("Decode"); if (dc is int) Decode = ((int)dc) != 0;
+                        object ck = k.GetValue("Clock"); if (ck is int) Clock = ((int)ck) != 0;
                     }
                 }
             }
@@ -156,6 +160,7 @@ namespace MatrixSaver
                 k.SetValue("Filler", Filler ? 1 : 0, RegistryValueKind.DWord);
                 k.SetValue("Theme", ThemeKey, RegistryValueKind.String);
                 k.SetValue("Decode", Decode ? 1 : 0, RegistryValueKind.DWord);
+                k.SetValue("Clock", Clock ? 1 : 0, RegistryValueKind.DWord);
             }
         }
     }
@@ -337,17 +342,19 @@ namespace MatrixSaver
 
         public GlyphCache(int cellW, int cellH) { _cellW = cellW; _cellH = cellH; }
 
+        // halo, when given, is baked INTO the cached pixels as a soft bloom around
+        // the glyph — so a glowing head costs exactly one blit at runtime.
         public void Draw(Graphics g, char ch, int style, Font font, bool rtl, Brush brush,
-                         int x, int y, int wcells)
+                         Brush halo, int x, int y, int wcells)
         {
             int key = ch | (style << 16);
             Slot s;
-            if (!_slots.TryGetValue(key, out s)) s = Rasterize(key, ch, font, rtl, brush, wcells);
+            if (!_slots.TryGetValue(key, out s)) s = Rasterize(key, ch, font, rtl, brush, halo, wcells);
             g.DrawImage(_sheets[s.Sheet], new Rectangle(x - Bleed, y - Bleed, s.W, s.H),
                         s.X, s.Y, s.W, s.H, GraphicsUnit.Pixel);
         }
 
-        Slot Rasterize(int key, char ch, Font font, bool rtl, Brush brush, int wcells)
+        Slot Rasterize(int key, char ch, Font font, bool rtl, Brush brush, Brush halo, int wcells)
         {
             int w = wcells * _cellW + 2 * Bleed, h = _cellH + 2 * Bleed;
             if (_sheets.Count == 0) NewSheet();
@@ -356,6 +363,28 @@ namespace MatrixSaver
             if (h > _rowH) _rowH = h;
 
             float gx = _x + Bleed, gy = _y + Bleed;   // cell origin inside the slot
+            if (halo != null)
+            {
+                // Two rings of low-alpha copies; overlaps compound near the glyph and
+                // thin out with distance, approximating a phosphor bloom falloff.
+                for (int dx = -1; dx <= 1; dx++)
+                    for (int dy = -1; dy <= 1; dy++)
+                        if (dx != 0 || dy != 0) DrawOne(ch, font, rtl, halo, gx + dx, gy + dy);
+                DrawOne(ch, font, rtl, halo, gx - 2, gy);
+                DrawOne(ch, font, rtl, halo, gx + 2, gy);
+                DrawOne(ch, font, rtl, halo, gx, gy - 2);
+                DrawOne(ch, font, rtl, halo, gx, gy + 2);
+            }
+            DrawOne(ch, font, rtl, brush, gx, gy);
+
+            var s = new Slot { Sheet = _sheets.Count - 1, X = _x, Y = _y, W = w, H = h };
+            _slots[key] = s;
+            _x += w;
+            return s;
+        }
+
+        void DrawOne(char ch, Font font, bool rtl, Brush brush, float gx, float gy)
+        {
             if (rtl)
             {
                 // Rotate 180° about the cell centre (see IsRtl for why).
@@ -371,11 +400,6 @@ namespace MatrixSaver
             {
                 _sg.DrawString(ch.ToString(), font, brush, gx, gy);
             }
-
-            var s = new Slot { Sheet = _sheets.Count - 1, X = _x, Y = _y, W = w, H = h };
-            _slots[key] = s;
-            _x += w;
-            return s;
         }
 
         const int MaxSheets = 24;   // ~24 MB; a huge CJK vocabulary can't grow unbounded
@@ -420,11 +444,11 @@ namespace MatrixSaver
     {
         const int Ramp = 4;
         const int Scramble = 2;      // how many of the newest placements shimmer (decode effect)
-        const double FarDim = 0.58;  // how far toward black the "far" depth tier sits
+        const int Tiers = 3;         // depth layers: 0 near (bright), 1 mid, 2 far (dim, slow)
+        static readonly double[] TierDim = { 0.0, 0.35, 0.62 };
 
-        // Glyph-cache style ids: tier*10 + {0 text, 1 fill, 2..5 rampText, 6..9 rampFill};
-        // 20 = glow. A style is just "which brush", so cached pixels can be reused.
-        const int StyleGlow = 20;
+        // Glyph-cache style ids: tier*10 + {0 text, 1 fill, 2..5 rampText, 6..9 rampFill}.
+        // A style is just "which brush(es)", so cached pixels can be reused.
 
         readonly Random _rng = new Random();
         readonly Bitmap _buffer;
@@ -456,17 +480,23 @@ namespace MatrixSaver
 
         volatile List<string> _pool;
 
-        // Depth: tier 0 rows are the foreground; tier 1 rows are dimmer and slower,
+        // Depth: tier 0 rows are the foreground; deeper tiers are dimmer and slower,
         // as if the rain continues behind the front layer.
-        readonly bool[] _farRow;
+        readonly byte[] _tier;
         readonly bool _decode;
 
-        readonly SolidBrush _fade = new SolidBrush(Color.FromArgb(22, 0, 0, 0));
-        readonly SolidBrush _glow;                                     // head halo
-        readonly SolidBrush[] _baseText = new SolidBrush[2];           // [tier]
-        readonly SolidBrush[] _baseFill = new SolidBrush[2];
-        readonly SolidBrush[][] _rampText = new SolidBrush[2][];       // [tier][depth]
-        readonly SolidBrush[][] _rampFill = new SolidBrush[2][];
+        readonly SolidBrush _fade = new SolidBrush(Color.FromArgb(20, 0, 0, 0));
+        readonly SolidBrush _glow;                                     // baked head bloom
+        readonly SolidBrush[] _baseText = new SolidBrush[Tiers];
+        readonly SolidBrush[] _baseFill = new SolidBrush[Tiers];
+        readonly SolidBrush[][] _rampText = new SolidBrush[Tiers][];   // [tier][depth]
+        readonly SolidBrush[][] _rampFill = new SolidBrush[Tiers][];
+
+        // The clock that materializes out of the rain at the top of each minute.
+        readonly bool _clockOn;
+        public bool ForceClock;      // harness /dump verification only
+        readonly Font _clockFont;
+        readonly SolidBrush _clockBright, _clockGlow, _clockPlate;
 
         public Bitmap Buffer { get { return _buffer; } }
 
@@ -498,10 +528,15 @@ namespace MatrixSaver
 
             Theme th = Theme.Get(Settings.ThemeKey);
             _decode = Settings.Decode;
-            _glow = new SolidBrush(Color.FromArgb(58, th.Head));
-            for (int tier = 0; tier < 2; tier++)
+            _glow = new SolidBrush(Color.FromArgb(38, th.Head));
+            _clockOn = Settings.Clock;
+            _clockFont = new Font("MS Gothic", fontSize * 3, FontStyle.Bold, GraphicsUnit.Pixel);
+            _clockBright = new SolidBrush(th.Head);
+            _clockGlow = new SolidBrush(Color.FromArgb(30, th.Head));
+            _clockPlate = new SolidBrush(Color.FromArgb(150, 0, 0, 0));
+            for (int tier = 0; tier < Tiers; tier++)
             {
-                double dim = tier == 0 ? 0.0 : FarDim;
+                double dim = TierDim[tier];
                 Color head = Lerp(th.Head, Color.Black, dim);
                 Color text = Lerp(th.Text, Color.Black, dim);
                 Color fill = Lerp(th.Fill, Color.Black, dim);
@@ -530,13 +565,15 @@ namespace MatrixSaver
             _hW = new byte[_rows][];
             _hPos = new int[_rows];
             _hCnt = new int[_rows];
-            _farRow = new bool[_rows];
+            _tier = new byte[_rows];
             for (int r = 0; r < _rows; r++)
             {
                 BuildRibbon(r);
-                _farRow[r] = _rng.NextDouble() < 0.35;
-                _speed[r] = _farRow[r] ? 0.16 + _rng.NextDouble() * 0.38
-                                       : 0.40 + _rng.NextDouble() * 1.05;
+                double dz = _rng.NextDouble();
+                _tier[r] = dz < 0.40 ? (byte)0 : dz < 0.70 ? (byte)1 : (byte)2;
+                _speed[r] = _tier[r] == 0 ? 0.45 + _rng.NextDouble() * 1.05
+                          : _tier[r] == 1 ? 0.28 + _rng.NextDouble() * 0.62
+                                          : 0.14 + _rng.NextDouble() * 0.34;
                 _pos[r] = _rng.Next(0, Math.Max(1, _ribbon[r].Length));
                 _idx[r] = (int)Math.Floor(_pos[r]);
                 _cursor[r] = _rng.Next(0, _cols);
@@ -633,11 +670,11 @@ namespace MatrixSaver
                    (c >= 0xFE70 && c <= 0xFEFF);    // Arabic presentation forms B
         }
 
-        // Draw one glyph via the atlas cache; RTL rotation is baked into the cached
-        // pixels, so runtime cost is a single blit regardless of script.
-        void DrawGlyph(char ch, int style, Brush b, int x, int y, int wcells)
+        // Draw one glyph via the atlas cache; RTL rotation (and the bloom halo, when
+        // given) are baked into the cached pixels, so runtime cost is a single blit.
+        void DrawGlyph(char ch, int style, Brush b, Brush halo, int x, int y, int wcells)
         {
-            _cache.Draw(_g, ch, style, FontFor(ch), IsRtl(ch), b, x, y, wcells);
+            _cache.Draw(_g, ch, style, FontFor(ch), IsRtl(ch), b, halo, x, y, wcells);
         }
 
         static Color Lerp(Color a, Color b, double t)
@@ -685,7 +722,7 @@ namespace MatrixSaver
                 byte[] wid = _wide[r];
                 int L = rib.Length;
                 int y = r * _cellH;
-                int tier = _farRow[r] ? 1 : 0;
+                int tier = _tier[r];
 
                 // Commit each newly reached character at its settled colour, advancing
                 // the column cursor by the character's width and wrapping at the edge.
@@ -702,7 +739,7 @@ namespace MatrixSaver
                         int wcells = wid[ci];
                         if (_cursor[r] + wcells > _cols) _cursor[r] = 0;   // don't straddle the edge
                         DrawGlyph(ch, tier * 10 + (mask[ci] ? 1 : 0),
-                                  mask[ci] ? _baseFill[tier] : _baseText[tier],
+                                  mask[ci] ? _baseFill[tier] : _baseText[tier], null,
                                   _cursor[r] * _cellW, y, wcells);
                         PushHist(r, _cursor[r], ch, mask[ci], (byte)wcells);
                         _cursor[r] += wcells;
@@ -726,17 +763,47 @@ namespace MatrixSaver
                     int style = tier * 10 + (_hFl[r][p] ? 6 : 2) + d;
                     Brush b = _hFl[r][p] ? _rampFill[tier][d] : _rampText[tier][d];
 
-                    if (d == 0 && tier == 0)
-                    {
-                        // Cheap bloom: a dim 1px halo behind the head glyph.
-                        DrawGlyph(ch, StyleGlow, _glow, x - 1, y, wcells);
-                        DrawGlyph(ch, StyleGlow, _glow, x + 1, y, wcells);
-                        DrawGlyph(ch, StyleGlow, _glow, x, y - 1, wcells);
-                        DrawGlyph(ch, StyleGlow, _glow, x, y + 1, wcells);
-                    }
-                    DrawGlyph(ch, style, b, x, y, wcells);
+                    // Foreground heads carry a baked phosphor bloom (still one blit).
+                    Brush halo = (d == 0 && tier == 0) ? _glow : null;
+                    DrawGlyph(ch, style, b, halo, x, y, wcells);
                 }
             }
+
+            if (_clockOn)
+            {
+                DateTime now = DateTime.Now;
+                double sec = now.Second + now.Millisecond / 1000.0;
+                if (ForceClock || sec < 8.0) DrawClock(now, sec);
+            }
+        }
+
+        // HH:MM materializes at screen centre at the top of each minute: the digits
+        // scramble-decode into place, glow on a darkening plate for a few seconds,
+        // then the fade wash dissolves the afterimage back into the rain.
+        void DrawClock(DateTime now, double sec)
+        {
+            string t = now.ToString("HH:mm");
+            if (sec < 0.9)
+            {
+                var sb = new StringBuilder(t);
+                for (int i = 0; i < sb.Length; i++)
+                    if (char.IsDigit(sb[i]) && _rng.NextDouble() > sec / 0.9)
+                        sb[i] = (char)('0' + _rng.Next(10));
+                t = sb.ToString();
+            }
+
+            SizeF sz = _g.MeasureString(t, _clockFont);
+            float x = (_buffer.Width - sz.Width) * 0.5f;
+            float y = (_buffer.Height - sz.Height) * 0.5f;
+
+            // The plate re-tints every frame, so it converges to near-black behind
+            // the digits while the clock is up, then fades out with everything else.
+            _g.FillRectangle(_clockPlate, x - 18, y - 8, sz.Width + 36, sz.Height + 16);
+            for (int dx = -2; dx <= 2; dx += 2)
+                for (int dy = -2; dy <= 2; dy += 2)
+                    if (dx != 0 || dy != 0)
+                        _g.DrawString(t, _clockFont, _clockGlow, x + dx, y + dy);
+            _g.DrawString(t, _clockFont, _clockBright, x, y);
         }
 
         public void Prewarm(int frames) { for (int i = 0; i < frames; i++) Step(); }
@@ -751,7 +818,11 @@ namespace MatrixSaver
             _fontRTL.Dispose();
             _fade.Dispose();
             _glow.Dispose();
-            for (int tier = 0; tier < 2; tier++)
+            _clockFont.Dispose();
+            _clockBright.Dispose();
+            _clockGlow.Dispose();
+            _clockPlate.Dispose();
+            for (int tier = 0; tier < Tiers; tier++)
             {
                 _baseText[tier].Dispose();
                 _baseFill[tier].Dispose();
@@ -951,6 +1022,7 @@ namespace MatrixSaver
         readonly CheckBox _filler = new CheckBox();
         readonly ComboBox _theme = new ComboBox();
         readonly CheckBox _decode = new CheckBox();
+        readonly CheckBox _clock = new CheckBox();
 
         public ConfigForm()
         {
@@ -959,7 +1031,7 @@ namespace MatrixSaver
             StartPosition = FormStartPosition.CenterScreen;
             MaximizeBox = false;
             MinimizeBox = false;
-            ClientSize = new Size(460, 452);
+            ClientSize = new Size(460, 484);
 
             Controls.Add(new Label { Text = "RSS feeds (mix in other languages for an all-text Matrix):",
                                      Location = new Point(12, 10), AutoSize = true });
@@ -1059,7 +1131,13 @@ namespace MatrixSaver
             _decode.Checked = Settings.Decode;
             Controls.Add(_decode);
 
-            var ok = new Button { Text = "OK", Location = new Point(268, 408), Size = new Size(80, 28),
+            _clock.Text = "Clock: HH:MM materializes out of the rain each minute.";
+            _clock.Location = new Point(12, 380);
+            _clock.AutoSize = true;
+            _clock.Checked = Settings.Clock;
+            Controls.Add(_clock);
+
+            var ok = new Button { Text = "OK", Location = new Point(268, 440), Size = new Size(80, 28),
                                   DialogResult = DialogResult.OK };
             ok.Click += (s, e) =>
             {
@@ -1069,12 +1147,13 @@ namespace MatrixSaver
                 Settings.Filler = _filler.Checked;
                 Settings.ThemeKey = Theme.Keys[Math.Max(0, _theme.SelectedIndex)];
                 Settings.Decode = _decode.Checked;
+                Settings.Clock = _clock.Checked;
                 try { Settings.Save(); } catch (Exception ex) { MessageBox.Show("Could not save: " + ex.Message); }
                 Close();
             };
             Controls.Add(ok);
 
-            var cancel = new Button { Text = "Cancel", Location = new Point(356, 408), Size = new Size(80, 28),
+            var cancel = new Button { Text = "Cancel", Location = new Point(356, 440), Size = new Size(80, 28),
                                       DialogResult = DialogResult.Cancel };
             cancel.Click += (s, e) => Close();
             Controls.Add(cancel);
