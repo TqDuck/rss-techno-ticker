@@ -55,13 +55,14 @@ namespace MatrixSaver
                     using (var eng = new MatrixEngine(960, 600, 16, Feed.FetchSegments()))
                     {
                         if (args.Length >= 5 && args[4] == "clock") eng.ForceClock = true;
+                        int frames = eng.ForceClock ? 400 : 260;   // clock: burst->hold->fade arc
                         var sw = System.Diagnostics.Stopwatch.StartNew();
-                        for (int i = 0; i < 260; i++) eng.Step();
+                        for (int i = 0; i < frames; i++) eng.Step();
                         sw.Stop();
                         eng.Buffer.Save(path, ImageFormat.Png);
                         File.WriteAllText(path + ".timing.txt", string.Format(
-                            "260 frames in {0} ms ({1:0.00} ms/frame)",
-                            sw.ElapsedMilliseconds, sw.ElapsedMilliseconds / 260.0));
+                            "{0} frames in {1} ms ({2:0.00} ms/frame)",
+                            frames, sw.ElapsedMilliseconds, (double)sw.ElapsedMilliseconds / frames));
                     }
                 }
                 catch (Exception ex)
@@ -441,10 +442,9 @@ namespace MatrixSaver
         static readonly double[] TierDim = { 0.0, 0.42, 0.64 };
 
         // Glyph-cache style ids: tier*20 + {0 text, 1 fill, 2..2+Ramp rampText,
-        // 10..10+Ramp rampFill}; then the clock specials below. A style is just
-        // "which brush(es)", so cached pixels can be reused.
-        const int StyleClock = 70;      // bright core of the converged time
-        const int StyleClockDim = 71;   // softer anti-aliased edge of the digits
+        // 10..10+Ramp rampFill}. A style is just "which brush(es)", so cached
+        // pixels can be reused. The clock needs no styles of its own: it holds
+        // existing rain at the ordinary settled style.
 
         readonly Random _rng = new Random();
         readonly Bitmap _buffer;
@@ -490,8 +490,12 @@ namespace MatrixSaver
         readonly bool _decode;
 
         // What character currently occupies each NEAR-grid cell ('\x01' marks the
-        // second cell of a wide glyph) — lets the clock re-illuminate the rain.
+        // second cell of a wide glyph) and the frame it was written — lets the
+        // clock hold the rain, and lets the back layers yield to fresh front text.
         readonly char[] _scr;
+        readonly int[] _scrF;
+        int _frame;
+        const int OccludeFrames = 80;   // how long committed near text stays "in front"
 
         // The mid-depth vertical layer: CJK text falling top-down on the mid grid.
         int _dropN;
@@ -514,14 +518,19 @@ namespace MatrixSaver
         readonly SolidBrush[][] _rampText = new SolidBrush[Tiers][];   // [tier][depth]
         readonly SolidBrush[][] _rampFill = new SolidBrush[Tiers][];
 
-        // The clock the rain converges into at the top of each minute.
+        // The clock: bursts seed the area before the minute turns, then an invisible
+        // HH:MM mask holds those rain cells against the fade so the time persists.
         readonly bool _clockOn;
         public bool ForceClock;      // harness /dump verification only
-        readonly SolidBrush _clockText, _clockEdge, _clockPlate;
-        int _clockMinute = -1;
-        byte[] _ckMask;              // per-cell ink coverage of the current HH:MM
-        char[] _ckFill;              // fresh glyphs for lit cells the rain left empty
+        int _ckBuiltMin = -1;
+        byte[] _ckMask;              // per-cell ink coverage of the pending HH:MM
         int _ckGw, _ckGh, _ckC0, _ckR0;
+        bool _ckHold;                // display window: rain parts around the time
+        int _ckX0, _ckY0, _ckX1, _ckY1;   // clock zone in pixels (with margin)
+        readonly int[] _bCol = new int[48];      // pre-minute burst streaks
+        readonly double[] _bRow = new double[48];
+        readonly double[] _bSpd = new double[48];
+        readonly bool[] _bLive = new bool[48];
 
         public Bitmap Buffer { get { return _buffer; } }
 
@@ -563,9 +572,6 @@ namespace MatrixSaver
             _glow = new SolidBrush(Color.FromArgb(52, th.Head));
             _glowMid = new SolidBrush(Color.FromArgb(24, th.Head));
             _clockOn = Settings.Clock;
-            _clockText = new SolidBrush(Lerp(th.Head, th.Text, 0.40));
-            _clockEdge = new SolidBrush(th.Text);
-            _clockPlate = new SolidBrush(Color.FromArgb(90, 0, 0, 0));
             for (int tier = 0; tier < Tiers; tier++)
             {
                 double dim = TierDim[tier];
@@ -585,6 +591,8 @@ namespace MatrixSaver
             }
 
             _scr = new char[_rows * _cols];
+            _scrF = new int[_rows * _cols];
+            for (int i = 0; i < _scrF.Length; i++) _scrF[i] = -OccludeFrames;
             ClassifyPool();
             for (int s = 0; s < 2; s++)
             {
@@ -914,12 +922,32 @@ namespace MatrixSaver
             _cacheT[tier].Draw(_g, ch, style, FontFor(tier, ch), b, halo, x, y, wcells);
         }
 
-        // Record what occupies a grid cell so the clock can re-illuminate the rain.
+        // Record what occupies a near-grid cell so the clock can hold the rain and
+        // the back layers know where the front layer currently has fresh text.
         void Mark(int row, int col, char ch, int w)
         {
             int b = row * _cols + col;
             _scr[b] = ch;
-            if (w == 2 && col + 1 < _cols) _scr[b + 1] = '\x01';
+            _scrF[b] = _frame;
+            if (w == 2 && col + 1 < _cols) { _scr[b + 1] = '\x01'; _scrF[b + 1] = _frame; }
+        }
+
+        // Does recently committed FRONT-layer text cover this pixel span? The back
+        // layers skip drawing there, so the left-to-right tickers always end up in
+        // front instead of being punched through by per-frame redraws behind them.
+        bool NearCovers(int xPx, int yPx, int wPx, int hPx)
+        {
+            int r0 = yPx / _cellH, r1 = Math.Min(_rows - 1, (yPx + hPx - 1) / _cellH);
+            int c0 = xPx / _cellW, c1 = Math.Min(_cols - 1, (xPx + wPx - 1) / _cellW);
+            for (int r = r0; r <= r1; r++)
+            {
+                if (r < 0 || r >= _rows) continue;
+                int b = r * _cols + c0;
+                for (int c = c0; c <= c1; c++, b++)
+                    if (_scr[b] != '\0' && _scr[b] != ' ' && _frame - _scrF[b] < OccludeFrames)
+                        return true;
+            }
+            return false;
         }
 
         static Color Lerp(Color a, Color b, double t)
@@ -959,17 +987,45 @@ namespace MatrixSaver
             _fade.Color = Color.FromArgb(Math.Max(3, Math.Min(60, fa)), 0, 0, 0);
             _g.FillRectangle(_fade, 0, 0, _buffer.Width, _buffer.Height);
 
+            DateTime now;
+            double sec;
+            if (ForceClock)
+            {
+                // Harness verification: synthesize a minute boundary at frame 240
+                // so one dump exercises the real burst -> hold -> dissolve arc.
+                if (_frame < 240)
+                {
+                    sec = 52.0 + _frame / 30.0;
+                    now = new DateTime(2026, 1, 1, 15, 4, Math.Min(59, (int)sec));
+                }
+                else
+                {
+                    sec = (_frame - 240) / 30.0;
+                    now = new DateTime(2026, 1, 1, 15, 5, Math.Min(59, (int)sec));
+                }
+            }
+            else
+            {
+                now = DateTime.Now;
+                sec = now.Second + now.Millisecond / 1000.0;
+            }
+            // While the time is displayed, the rain parts around it: nothing new is
+            // drawn inside the zone, so the surroundings fade to black underneath
+            // the held glyphs and the digits stand alone.
+            _ckHold = _clockOn && _ckMask != null && now.Minute == _ckBuiltMin && sec < 9.0;
+
             for (int r = 0; r < _rowsT[2]; r++) if (_active[SetF][r]) StepRow(SetF, r, dt);
             StepDrops(dt);
             StepRisers(dt);
             for (int r = 0; r < _rowsT[0]; r++) if (_active[SetN][r]) StepRow(SetN, r, dt);
 
-            if (_clockOn)
-            {
-                DateTime now = DateTime.Now;
-                double sec = now.Second + now.Millisecond / 1000.0;
-                if (ForceClock || sec < 8.0) DrawClock(now, sec);
-            }
+            if (_clockOn) UpdateClock(now, sec, dt);
+            _frame++;
+        }
+
+        bool InClockZone(int xPx, int yPx)
+        {
+            return _ckHold && xPx >= _ckX0 && xPx < _ckX1 && yPx >= _ckY0 && yPx < _ckY1;
         }
 
         void StepRow(int s, int r, double dt)
@@ -1016,10 +1072,14 @@ namespace MatrixSaver
                         _cursor[s][r] -= wcells;
                         if (_cursor[s][r] < 0) _cursor[s][r] = cols - 1;
                     }
-                    DrawGlyph(tier, ch, tier * 20 + (mask[ci] ? 1 : 0),
-                              mask[ci] ? _baseFill[tier] : _baseText[tier], null,
-                              at * cw, y, wcells);
-                    if (s == SetN) Mark(r, at, ch, wcells);
+                    if (!InClockZone(at * cw, y) &&
+                        (s == SetN || !NearCovers(at * cw, y, wcells * cw, chh)))
+                    {
+                        DrawGlyph(tier, ch, tier * 20 + (mask[ci] ? 1 : 0),
+                                  mask[ci] ? _baseFill[tier] : _baseText[tier], null,
+                                  at * cw, y, wcells);
+                        if (s == SetN) Mark(r, at, ch, wcells);
+                    }
                     PushHist(s, r, at, ch, mask[ci], (byte)wcells);
                 }
                 _idx[s][r]++;
@@ -1034,6 +1094,8 @@ namespace MatrixSaver
                 int p = Mod(_hPos[s][r] - 1 - d, Ramp);
                 int wcells = _hW[s][r][p];
                 int x = _hCol[s][r][p] * cw;
+                if (InClockZone(x, y)) continue;
+                if (s != SetN && NearCovers(x, y, wcells * cw, chh)) continue;
                 _g.FillRectangle(Brushes.Black, x, y, wcells * cw, chh);
 
                 char ch = (_decode && d < Scramble) ? ScrambleGlyph(wcells) : _hCh[s][r][p];
@@ -1122,6 +1184,8 @@ namespace MatrixSaver
                     if (ch == '\0' || ch == ' ') continue;    // grouping gap
                     int w = W(ch);
                     int col = Math.Min(_uCol[i], cols - w);
+                    if (InClockZone(col * cw, row * chh)) continue;
+                    if (NearCovers(col * cw, row * chh, w * cw, chh)) continue;
                     _g.FillRectangle(Brushes.Black, col * cw, row * chh, w * cw, chh);
                     int age = head - 1 - k;                   // 0 = newest placement
                     bool fresh = age < Ramp;
@@ -1157,6 +1221,8 @@ namespace MatrixSaver
                     if (ch == ' ') continue;
                     int w = W(ch);
                     int col = Math.Min(_dCol[i], cols - w);
+                    if (InClockZone(col * cw, row * chh)) continue;
+                    if (NearCovers(col * cw, row * chh, w * cw, chh)) continue;
                     DrawGlyph(1, ch, 20, _baseText[1], null, col * cw, row * chh, w);
                 }
                 if (respawn) { SpawnDrop(i); continue; }
@@ -1171,6 +1237,8 @@ namespace MatrixSaver
                     if (ch == ' ') continue;
                     int w = W(ch);
                     int col = Math.Min(_dCol[i], cols - w);
+                    if (InClockZone(col * cw, row * chh)) continue;
+                    if (NearCovers(col * cw, row * chh, w * cw, chh)) continue;
                     _g.FillRectangle(Brushes.Black, col * cw, row * chh, w * cw, chh);
                     char show = (_decode && d < Scramble) ? ScrambleGlyph(w) : ch;
                     DrawGlyph(1, show, 20 + 2 + d, _rampText[1][d], d == 0 ? _glowMid : null,
@@ -1179,58 +1247,99 @@ namespace MatrixSaver
             }
         }
 
-        // The time CONVERGES out of the rain. Once a minute HH:MM is rasterized from
-        // a real font into a per-CELL ink-coverage mask (so the digits are font-smooth,
-        // not blocky dot-matrix). While the clock is up, whatever characters the rain
-        // has already left inside that mask re-illuminate brighter — live tickers and
-        // falling columns keep writing through it, so the digits shimmer with real
-        // content — and gaps fill with fresh glyphs. The fade then melts it back in.
-        void DrawClock(DateTime now, double sec)
+        // The clock, without any overlay. In the seconds BEFORE the minute turns,
+        // rain bursts streak down through the area where the time will appear,
+        // seeding it with glyphs. An invisible outline of the incoming HH:MM is
+        // imposed over that area; once the minute arrives, the cells under the
+        // outline are simply refreshed at their ordinary settled brightness every
+        // frame — left on longer than normal — while everything around them fades.
+        // The persisting glyphs spell the time; then the refresh stops and they
+        // dissolve like all the rest of the rain.
+        void UpdateClock(DateTime now, double sec, double dt)
         {
-            if (now.Minute != _clockMinute)
+            // Lead-up: build the invisible mask for the minute about to be shown
+            // and run the seeding bursts through its area.
+            if (sec >= 52.0)
             {
-                _clockMinute = now.Minute;
-                BuildClockMask(now.ToString("HH:mm"));
+                DateTime tgt = now.AddMinutes(1);
+                if (tgt.Minute != _ckBuiltMin)
+                {
+                    _ckBuiltMin = tgt.Minute;
+                    BuildClockMask(tgt.ToString("HH:mm"));
+                }
+                if (_ckMask != null) StepBursts(dt);
             }
             if (_ckMask == null) return;
 
-            // A gentle plate dims the rain around the digits so the bright pattern
-            // reads clearly; it converges over a few frames and fades out with the rest.
-            _g.FillRectangle(_clockPlate, (_ckC0 - 1) * _cellW, (_ckR0 - 1) * _cellH,
-                             (_ckGw + 2) * _cellW, (_ckGh + 2) * _cellH);
+            // Display window: hold the masked cells against the fade.
+            if (now.Minute != _ckBuiltMin || sec >= 9.0) return;
 
-            double reveal = sec < 1.5 ? sec / 1.5 : 1.0;
+            double reveal = sec < 1.2 ? sec / 1.2 : 1.0;
             for (int cr = 0; cr < _ckGh; cr++)
                 for (int cc = 0; cc < _ckGw; cc++)
                 {
-                    int mi = cr * _ckGw + cc;
-                    int m = _ckMask[mi];
-                    if (m < 90) continue;                    // no ink at this cell
+                    if (_ckMask[cr * _ckGw + cc] < 60) continue;    // no ink here
 
-                    // Deterministic scatter: each cell converges at its own moment.
-                    uint hsh = (uint)((cc * 73856093) ^ (cr * 19349663) ^ (_clockMinute * 83492791));
+                    // Deterministic scatter: each cell joins the hold at its own moment.
+                    uint hsh = (uint)((cc * 73856093) ^ (cr * 19349663) ^ (_ckBuiltMin * 83492791));
                     if (reveal < 1.0 && (hsh % 997) / 997.0 > reveal) continue;
 
-                    // Re-illuminate whatever character the rain left here; brand-new
-                    // glyphs only where the cell is empty.
                     int gcol = _ckC0 + cc, grow = _ckR0 + cr;
                     int at = gcol;
                     char ch = _scr[grow * _cols + gcol];
                     if (ch == '\x01' && gcol > 0) { at = gcol - 1; ch = _scr[grow * _cols + at]; }
                     if (ch <= ' ')
                     {
-                        if (_ckFill[mi] == '\0' || _rng.Next(100) < 5) _ckFill[mi] = Gib();
-                        ch = _ckFill[mi];
+                        // A gap the bursts didn't reach: commit one fresh glyph to
+                        // the rain here, and hold it like the others.
+                        ch = Gib();
+                        Mark(grow, gcol, ch, 1);
                         at = gcol;
+                    }
+                    // A slow shimmer keeps the held glyphs alive instead of frozen.
+                    if (!IsWide(ch) && _rng.Next(100) < 2)
+                    {
+                        ch = Gib();
+                        Mark(grow, at, ch, 1);
                     }
                     int w = IsWide(ch) ? 2 : 1;
                     if (at + w > _cols) at = _cols - w;
-
-                    bool core = m > 160;                     // solid ink vs anti-aliased edge
-                    DrawGlyph(0, ch, core ? StyleClock : StyleClockDim,
-                              core ? _clockText : _clockEdge, core ? _glow : null,
-                              at * _cellW, grow * _cellH, w);
+                    // "Left on longer than normal": held cells stay at the recently-lit
+                    // brightness they had, while everything around them fades away.
+                    DrawGlyph(0, ch, 3, _rampText[0][1], null, at * _cellW, grow * _cellH, w);
                 }
+        }
+
+        // Short vertical streaks confined to the clock's area, writing ordinary rain
+        // glyphs into it so the mask has material to hold when the minute turns.
+        void StepBursts(double dt)
+        {
+            int spawn = 2;
+            for (int i = 0; i < _bCol.Length; i++)
+            {
+                if (!_bLive[i])
+                {
+                    if (spawn > 0)
+                    {
+                        spawn--;
+                        _bLive[i] = true;
+                        _bCol[i] = Math.Min(_cols - 1, _ckC0 + _rng.Next(Math.Max(1, _ckGw)));
+                        _bRow[i] = _ckR0 - 1 - _rng.Next(0, 5);
+                        _bSpd[i] = 0.7 + _rng.NextDouble() * 1.1;
+                    }
+                    continue;
+                }
+                double prev = _bRow[i];
+                _bRow[i] += _bSpd[i] * dt;
+                for (int r = (int)Math.Ceiling(prev); r <= (int)Math.Floor(_bRow[i]); r++)
+                {
+                    if (r < _ckR0 - 1 || r > _ckR0 + _ckGh || r < 0 || r >= _rows) continue;
+                    char g = Gib();
+                    DrawGlyph(0, g, 2, _rampText[0][0], null, _bCol[i] * _cellW, r * _cellH, 1);
+                    Mark(r, _bCol[i], g, 1);
+                }
+                if (_bRow[i] > _ckR0 + _ckGh + 1) _bLive[i] = false;
+            }
         }
 
         // Rasterize HH:MM into a small bitmap and sample it per grid cell, producing
@@ -1238,7 +1347,7 @@ namespace MatrixSaver
         void BuildClockMask(string t)
         {
             _ckMask = null;
-            int gh = Math.Max(8, Math.Min((int)(_rows * 0.40), 22));
+            int gh = Math.Max(10, Math.Min((int)(_rows * 0.55), 26));
             float px = gh * _cellH * 0.95f;
             var sf = StringFormat.GenericTypographic;
             // A heavy face for the mask only (the pixels drawn are still rain glyphs):
@@ -1262,6 +1371,10 @@ namespace MatrixSaver
                 _ckC0 = (_cols - gw) / 2;
                 _ckR0 = (_rows - gh) / 2;
                 if (_ckC0 < 1 || _ckR0 < 1 || gw < 5) return;   // pane too small (preview)
+                _ckX0 = (_ckC0 - 1) * _cellW;                   // parting zone, one cell margin
+                _ckY0 = (_ckR0 - 1) * _cellH;
+                _ckX1 = (_ckC0 + gw + 1) * _cellW;
+                _ckY1 = (_ckR0 + gh + 1) * _cellH;
 
                 using (var bmp = new Bitmap(gw * _cellW, gh * _cellH, PixelFormat.Format32bppRgb))
                 using (var bg = Graphics.FromImage(bmp))
@@ -1272,7 +1385,6 @@ namespace MatrixSaver
                                   (bmp.Width - sz.Width) * 0.5f, (bmp.Height - sz.Height) * 0.5f, sf);
 
                     _ckMask = new byte[gw * gh];
-                    _ckFill = new char[gw * gh];
                     for (int cr = 0; cr < gh; cr++)
                         for (int cc = 0; cc < gw; cc++)
                         {
@@ -1310,9 +1422,6 @@ namespace MatrixSaver
             _fade.Dispose();
             _glow.Dispose();
             _glowMid.Dispose();
-            _clockText.Dispose();
-            _clockEdge.Dispose();
-            _clockPlate.Dispose();
             for (int tier = 0; tier < Tiers; tier++)
             {
                 _baseText[tier].Dispose();

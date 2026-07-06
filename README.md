@@ -56,12 +56,15 @@ glyphs take two cells):
   top edge the next nation takes over from the bottom.
 - **Phosphor bloom** — foreground heads radiate a three-ring baked-in glow halo,
   the falling columns a softer one (free at runtime — it lives in the glyph cache).
-- **The rain converges into a clock** — at the top of each minute the characters
-  already on screen inside the shape of HH:MM re-illuminate brighter (gaps fill
-  with fresh glyphs), so the code itself arranges into the time. The digit shapes
-  come from a real font sampled per grid cell — smooth, not blocky — and live
-  tickers keep writing straight through them, so the time shimmers with actual
-  headlines until the fade melts it back into rain (toggleable).
+- **The clock is an afterimage in the rain** — in the seconds before the minute
+  turns, glyph bursts streak down through the area where the time will appear.
+  An invisible outline of the incoming HH:MM (a real font sampled per grid
+  cell) is imposed over that area; when the minute arrives, the rain parts
+  around the zone and the cells under the outline are simply *left on longer
+  than normal* — held at their recently-lit brightness while everything around
+  them fades to black. The persisting glyphs spell the time, shimmering
+  quietly, then the hold releases and they dissolve like ordinary rain
+  (toggleable).
 - **Settings dialog** — add/remove feed URLs, **Test all** to health-check every
   feed (item count or the exact failure), cap or uncap description length,
   toggle the katakana filler, pick a theme, toggle the decode effect and the
@@ -131,8 +134,11 @@ copy the file to a `.exe` name and invoke that directly.
   density** — `_dropN` (default one drop per 5 mid-grid columns).
 - **Debt figures** — the `Debts` table (sign, base amount pinned to `DebtEpoch`,
   growth per year, regional grouping style); **riser count** — `_riseN`.
-- **Clock size** — the `_rows * 0.40` height and `0.80` width caps in
-  `BuildClockMask`; **legibility thresholds** — the `90`/`160` ink cutoffs.
+- **Clock size** — the `_rows * 0.55` height and `0.80` width caps in
+  `BuildClockMask`; **stroke fullness** — the `60` ink cutoff in `UpdateClock`;
+  **hold length** — the `9.0`-second display window.
+- **Front-layer occlusion** — `OccludeFrames` (how long fresh ticker text keeps
+  the back layers from drawing over it).
 - **Sweep speed** — the `_speed[r]` ranges in the constructor.
 - **Text size** — `fontSize` in `MatrixForm.OnLoad` (18 full-screen, 11 preview).
 
