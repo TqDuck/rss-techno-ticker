@@ -438,7 +438,7 @@ namespace MatrixSaver
         const int Ramp = 6;          // bright comet tail length behind each head
         const int Scramble = 2;      // how many of the newest placements shimmer (decode effect)
         const int Tiers = 3;         // 0 near LTR rows, 1 mid vertical CJK, 2 far RTL rows
-        static readonly double[] TierDim = { 0.0, 0.30, 0.55 };
+        static readonly double[] TierDim = { 0.0, 0.42, 0.64 };
 
         // Glyph-cache style ids: tier*20 + {0 text, 1 fill, 2..2+Ramp rampText,
         // 10..10+Ramp rampFill}; then the clock specials below. A style is just
@@ -449,45 +449,51 @@ namespace MatrixSaver
         readonly Random _rng = new Random();
         readonly Bitmap _buffer;
         readonly Graphics _g;
-        readonly GlyphCache _cache;
-        readonly Font _font;     // MS Gothic: Latin, Cyrillic, kana, most CJK Han
-        readonly Font _fontKR;   // Malgun Gothic: Korean Hangul (MS Gothic lacks it)
-        readonly Font _fontRTL;  // Tahoma: Hebrew / Arabic / Persian
-        readonly int _cellW, _cellH, _cols, _rows;
 
-        // Per-row stream state. The head advances in CHARACTERS; the screen column is
-        // tracked separately because characters are 1 or 2 cells wide.
-        readonly double[] _pos;      // head progress, in characters
-        readonly double[] _speed;    // characters advanced per frame
-        readonly int[] _idx;         // characters committed so far (absolute)
-        readonly int[] _cursor;      // next screen column to place at (wraps)
-        readonly string[] _ribbon;
-        readonly bool[][] _filler;
-        readonly byte[][] _wide;     // cell width per char: 1 or 2
+        // Depth is SIZE as much as brightness: each tier renders on its own grid
+        // with progressively smaller type, so the back layers actually sit farther
+        // away instead of just being dimmer copies of the front.
+        readonly GlyphCache[] _cacheT = new GlyphCache[Tiers];
+        readonly Font[] _fontT = new Font[Tiers];     // MS Gothic: Latin, Cyrillic, kana, Han
+        readonly Font[] _fontKRT = new Font[Tiers];   // Malgun Gothic: Korean Hangul
+        readonly Font[] _fontRTLT = new Font[Tiers];  // Tahoma: Hebrew / Arabic / Persian
+        readonly int[] _cwT = new int[Tiers], _chT = new int[Tiers];
+        readonly int[] _colsT = new int[Tiers], _rowsT = new int[Tiers];
+        readonly int _cellW, _cellH, _cols, _rows;    // near-grid shorthand (clock, _scr)
+
+        // Two independent horizontal row sets on different grids: set 0 = near LTR
+        // tickers (tier 0), set 1 = far RTL tickers (tier 2). Not every row slot is
+        // active — the gaps are where the layers behind show through.
+        const int SetN = 0, SetF = 1;
+        static int SetTier(int s) { return s == 0 ? 0 : 2; }
+        readonly bool[][] _active = new bool[2][];
+        readonly double[][] _pos = new double[2][];    // head progress, in characters
+        readonly double[][] _speed = new double[2][];  // characters advanced per frame
+        readonly int[][] _idx = new int[2][];          // characters committed so far
+        readonly int[][] _cursor = new int[2][];       // next screen column (wraps)
+        readonly int[][] _dirRow = new int[2][];       // +1 left-to-right, -1 right-to-left
+        readonly string[][] _ribbon = new string[2][];
+        readonly bool[][][] _filler = new bool[2][][];
+        readonly byte[][][] _wide = new byte[2][][];   // cell width per char: 1 or 2
 
         // Tiny per-row history of the last few placements, so the head ramp can be
         // redrawn at the right columns each frame despite variable widths.
-        readonly int[][] _hCol;
-        readonly char[][] _hCh;
-        readonly bool[][] _hFl;
-        readonly byte[][] _hW;
-        readonly int[] _hPos;
-        readonly int[] _hCnt;
+        readonly int[][][] _hCol = new int[2][][];
+        readonly char[][][] _hCh = new char[2][][];
+        readonly bool[][][] _hFl = new bool[2][][];
+        readonly byte[][][] _hW = new byte[2][][];
+        readonly int[][] _hPos = new int[2][];
+        readonly int[][] _hCnt = new int[2][];
 
         volatile List<string> _pool;
         List<string> _poolLtr, _poolCjk, _poolRtl;   // the pool split by script
-
-        // Depth: tier 0 rows are the foreground; the far tier is dimmer and slower,
-        // as if the rain continues behind the front layer.
-        readonly byte[] _tier;
-        readonly int[] _dir;         // +1 head sweeps left-to-right, -1 right-to-left
         readonly bool _decode;
 
-        // What character currently occupies each grid cell ('\x01' marks the second
-        // cell of a wide glyph) — this is what lets the clock re-illuminate the rain.
+        // What character currently occupies each NEAR-grid cell ('\x01' marks the
+        // second cell of a wide glyph) — lets the clock re-illuminate the rain.
         readonly char[] _scr;
 
-        // The mid-depth vertical layer: CJK text falling top-down, one drop per column.
+        // The mid-depth vertical layer: CJK text falling top-down on the mid grid.
         int _dropN;
         int[] _dCol; double[] _dPos, _dSpd; int[] _dIdx; string[] _dTxt;
 
@@ -526,15 +532,22 @@ namespace MatrixSaver
             _g.PixelOffsetMode = PixelOffsetMode.Half;
             _g.CompositingQuality = CompositingQuality.HighSpeed;
 
-            _font = new Font("MS Gothic", fontSize, FontStyle.Bold, GraphicsUnit.Pixel);
-            _fontKR = new Font("Malgun Gothic", fontSize, FontStyle.Bold, GraphicsUnit.Pixel);
-            _fontRTL = new Font("Tahoma", fontSize, FontStyle.Bold, GraphicsUnit.Pixel);
-            SizeF m = _g.MeasureString("M", _font, PointF.Empty, StringFormat.GenericTypographic);
-            _cellW = Math.Max(1, (int)Math.Round(m.Width));   // half-width cell
-            _cellH = Math.Max(1, (int)Math.Ceiling(_font.GetHeight(_g) * 1.18));
-            _cols = Math.Max(2, w / _cellW);
-            _rows = Math.Max(1, h / _cellH);
-            _cache = new GlyphCache(_cellW, _cellH);
+            // Perspective: the mid layer at ~2/3 size, the far layer at ~1/2 size.
+            int[] sizes = { fontSize, Math.Max(7, fontSize * 2 / 3), Math.Max(6, fontSize / 2) };
+            for (int t = 0; t < Tiers; t++)
+            {
+                _fontT[t] = new Font("MS Gothic", sizes[t], FontStyle.Bold, GraphicsUnit.Pixel);
+                _fontKRT[t] = new Font("Malgun Gothic", sizes[t], FontStyle.Bold, GraphicsUnit.Pixel);
+                _fontRTLT[t] = new Font("Tahoma", sizes[t], FontStyle.Bold, GraphicsUnit.Pixel);
+                SizeF m = _g.MeasureString("M", _fontT[t], PointF.Empty, StringFormat.GenericTypographic);
+                _cwT[t] = Math.Max(1, (int)Math.Round(m.Width));   // half-width cell
+                _chT[t] = Math.Max(1, (int)Math.Ceiling(_fontT[t].GetHeight(_g) * 1.18));
+                _colsT[t] = Math.Max(2, w / _cwT[t]);
+                _rowsT[t] = Math.Max(1, h / _chT[t]);
+                _cacheT[t] = new GlyphCache(_cwT[t], _chT[t]);
+            }
+            _cellW = _cwT[0]; _cellH = _chT[0];
+            _cols = _colsT[0]; _rows = _rowsT[0];
 
             Theme th = Theme.Get(Settings.ThemeKey);
             _decode = Settings.Decode;
@@ -562,40 +575,46 @@ namespace MatrixSaver
                 }
             }
 
-            _pos = new double[_rows];
-            _speed = new double[_rows];
-            _idx = new int[_rows];
-            _cursor = new int[_rows];
-            _ribbon = new string[_rows];
-            _filler = new bool[_rows][];
-            _wide = new byte[_rows][];
-            _hCol = new int[_rows][];
-            _hCh = new char[_rows][];
-            _hFl = new bool[_rows][];
-            _hW = new byte[_rows][];
-            _hPos = new int[_rows];
-            _hCnt = new int[_rows];
-            _tier = new byte[_rows];
-            _dir = new int[_rows];
             _scr = new char[_rows * _cols];
             ClassifyPool();
-            for (int r = 0; r < _rows; r++)
+            for (int s = 0; s < 2; s++)
             {
-                double dz = _rng.NextDouble();
-                _tier[r] = dz < 0.60 ? (byte)0 : (byte)2;   // rows are near or far; mid is vertical
-                BuildRibbon(r);
-                _speed[r] = _tier[r] == 0 ? 0.45 + _rng.NextDouble() * 1.05
-                                          : 0.14 + _rng.NextDouble() * 0.34;
-                _pos[r] = _rng.Next(0, Math.Max(1, _ribbon[r].Length));
-                _idx[r] = (int)Math.Floor(_pos[r]);
-                _cursor[r] = _rng.Next(0, _cols);
-                _hCol[r] = new int[Ramp];
-                _hCh[r] = new char[Ramp];
-                _hFl[r] = new bool[Ramp];
-                _hW[r] = new byte[Ramp];
+                int t = SetTier(s), rows = _rowsT[t];
+                _active[s] = new bool[rows];
+                _pos[s] = new double[rows];
+                _speed[s] = new double[rows];
+                _idx[s] = new int[rows];
+                _cursor[s] = new int[rows];
+                _dirRow[s] = new int[rows];
+                _ribbon[s] = new string[rows];
+                _filler[s] = new bool[rows][];
+                _wide[s] = new byte[rows][];
+                _hCol[s] = new int[rows][];
+                _hCh[s] = new char[rows][];
+                _hFl[s] = new bool[rows][];
+                _hW[s] = new byte[rows][];
+                _hPos[s] = new int[rows];
+                _hCnt[s] = new int[rows];
+                for (int r = 0; r < rows; r++)
+                {
+                    // Near rows stay sparse so the small layers behind show through;
+                    // the far grid fills almost solid — a dense wall of tiny text.
+                    _active[s][r] = _rng.NextDouble() < (s == SetN ? 0.55 : 0.90);
+                    if (!_active[s][r]) continue;
+                    BuildRibbon(s, r);
+                    _speed[s][r] = s == SetN ? 0.45 + _rng.NextDouble() * 1.05
+                                             : 0.10 + _rng.NextDouble() * 0.28;
+                    _pos[s][r] = _rng.Next(0, Math.Max(1, _ribbon[s][r].Length));
+                    _idx[s][r] = (int)Math.Floor(_pos[s][r]);
+                    _cursor[s][r] = _rng.Next(0, _colsT[t]);
+                    _hCol[s][r] = new int[Ramp];
+                    _hCh[s][r] = new char[Ramp];
+                    _hFl[s][r] = new bool[Ramp];
+                    _hW[s][r] = new byte[Ramp];
+                }
             }
 
-            _dropN = Math.Max(2, _cols / 5);
+            _dropN = Math.Max(2, _colsT[1] / 5);
             _dCol = new int[_dropN];
             _dPos = new double[_dropN];
             _dSpd = new double[_dropN];
@@ -605,7 +624,7 @@ namespace MatrixSaver
             {
                 SpawnDrop(i);
                 // Stagger the first cycle so drops don't all start at the top edge.
-                _dPos[i] = -_rng.NextDouble() * _rows * 2;
+                _dPos[i] = -_rng.NextDouble() * _rowsT[1] * 2;
                 _dIdx[i] = (int)Math.Floor(_dPos[i]);
             }
         }
@@ -615,7 +634,9 @@ namespace MatrixSaver
             if (pool == null || pool.Count == 0) return;
             _pool = pool;
             ClassifyPool();
-            for (int r = 0; r < _rows; r++) BuildRibbon(r);
+            for (int s = 0; s < 2; s++)
+                for (int r = 0; r < _ribbon[s].Length; r++)
+                    if (_active[s][r]) BuildRibbon(s, r);
         }
 
         // Split the pool by script so each depth layer can show text in its native
@@ -664,10 +685,10 @@ namespace MatrixSaver
             return new string(a);
         }
 
-        void BuildRibbon(int r)
+        void BuildRibbon(int s, int r)
         {
-            bool rtl = _tier[r] == 2 && _poolRtl.Count > 0;
-            _dir[r] = rtl ? -1 : 1;
+            bool rtl = s == SetF && _poolRtl.Count > 0;
+            _dirRow[s][r] = rtl ? -1 : 1;
             List<string> p = rtl ? _poolRtl
                            : _poolLtr.Count > 0 ? _poolLtr
                            : _poolCjk.Count > 0 ? _poolCjk
@@ -697,9 +718,9 @@ namespace MatrixSaver
                 }
                 sb.Append(' '); mask.Add(false); wid.Add(1);
             }
-            _ribbon[r] = sb.ToString();
-            _filler[r] = mask.ToArray();
-            _wide[r] = wid.ToArray();
+            _ribbon[s][r] = sb.ToString();
+            _filler[s][r] = mask.ToArray();
+            _wide[s][r] = wid.ToArray();
         }
 
         char Gib()
@@ -740,12 +761,12 @@ namespace MatrixSaver
                    (c >= 0xFFE0 && c <= 0xFFE6);    // full-width signs
         }
 
-        Font FontFor(char c)
+        Font FontFor(int tier, char c)
         {
-            if (IsRtl(c)) return _fontRTL;
+            if (IsRtl(c)) return _fontRTLT[tier];
             if ((c >= 0xAC00 && c <= 0xD7A3) || (c >= 0x1100 && c <= 0x11FF) ||
-                (c >= 0x3130 && c <= 0x318F)) return _fontKR;   // Hangul -> Malgun Gothic
-            return _font;
+                (c >= 0x3130 && c <= 0x318F)) return _fontKRT[tier];   // Hangul
+            return _fontT[tier];
         }
 
         // Hebrew / Arabic / Persian — routes segments to the RTL layer, where heads
@@ -763,11 +784,12 @@ namespace MatrixSaver
                    (c >= 0xFE70 && c <= 0xFEFF);    // Arabic presentation forms B
         }
 
-        // Draw one glyph via the atlas cache; the bloom halo, when given, is baked
-        // into the cached pixels, so runtime cost is a single blit.
-        void DrawGlyph(char ch, int style, Brush b, Brush halo, int x, int y, int wcells)
+        // Draw one glyph via its tier's atlas cache (each tier has its own type
+        // size); the bloom halo, when given, is baked into the cached pixels, so
+        // runtime cost is a single blit.
+        void DrawGlyph(int tier, char ch, int style, Brush b, Brush halo, int x, int y, int wcells)
         {
-            _cache.Draw(_g, ch, style, FontFor(ch), b, halo, x, y, wcells);
+            _cacheT[tier].Draw(_g, ch, style, FontFor(tier, ch), b, halo, x, y, wcells);
         }
 
         // Record what occupies a grid cell so the clock can re-illuminate the rain.
@@ -788,12 +810,12 @@ namespace MatrixSaver
 
         static int Mod(int a, int n) { int m = a % n; return m < 0 ? m + n : m; }
 
-        void PushHist(int r, int col, char ch, bool fl, byte w)
+        void PushHist(int s, int r, int col, char ch, bool fl, byte w)
         {
-            int p = _hPos[r];
-            _hCol[r][p] = col; _hCh[r][p] = ch; _hFl[r][p] = fl; _hW[r][p] = w;
-            _hPos[r] = Mod(p + 1, Ramp);
-            if (_hCnt[r] < Ramp) _hCnt[r]++;
+            int p = _hPos[s][r];
+            _hCol[s][r][p] = col; _hCh[s][r][p] = ch; _hFl[s][r][p] = fl; _hW[s][r][p] = w;
+            _hPos[s][r] = Mod(p + 1, Ramp);
+            if (_hCnt[s][r] < Ramp) _hCnt[s][r]++;
         }
 
         // Decode shimmer: a random stand-in glyph shown while a placement is still
@@ -815,9 +837,9 @@ namespace MatrixSaver
             _fade.Color = Color.FromArgb(Math.Max(3, Math.Min(60, fa)), 0, 0, 0);
             _g.FillRectangle(_fade, 0, 0, _buffer.Width, _buffer.Height);
 
-            for (int r = 0; r < _rows; r++) if (_tier[r] == 2) StepRow(r, dt);
+            for (int r = 0; r < _rowsT[2]; r++) if (_active[SetF][r]) StepRow(SetF, r, dt);
             StepDrops(dt);
-            for (int r = 0; r < _rows; r++) if (_tier[r] == 0) StepRow(r, dt);
+            for (int r = 0; r < _rowsT[0]; r++) if (_active[SetN][r]) StepRow(SetN, r, dt);
 
             if (_clockOn)
             {
@@ -827,75 +849,77 @@ namespace MatrixSaver
             }
         }
 
-        void StepRow(int r, double dt)
+        void StepRow(int s, int r, double dt)
         {
-            _pos[r] += _speed[r] * dt;
-            int target = (int)Math.Floor(_pos[r]);
-            string rib = _ribbon[r];
-            bool[] mask = _filler[r];
-            byte[] wid = _wide[r];
+            int tier = SetTier(s);
+            int cw = _cwT[tier], chh = _chT[tier], cols = _colsT[tier];
+            _pos[s][r] += _speed[s][r] * dt;
+            int target = (int)Math.Floor(_pos[s][r]);
+            string rib = _ribbon[s][r];
+            bool[] mask = _filler[s][r];
+            byte[] wid = _wide[s][r];
             int L = rib.Length;
-            int y = r * _cellH;
-            int tier = _tier[r];
+            int y = r * chh;
+            int dir = _dirRow[s][r];
 
             // Commit each newly reached character at its settled colour, advancing
             // the column cursor by the character's width — leftward on RTL rows —
             // and wrapping at the edge.
-            while (_idx[r] < target)
+            while (_idx[s][r] < target)
             {
-                int ci = Mod(_idx[r], L);
+                int ci = Mod(_idx[s][r], L);
                 char ch = rib[ci];
                 if (ch == ' ')
                 {
-                    _cursor[r] += _dir[r];
-                    if (_cursor[r] >= _cols) _cursor[r] = 0;
-                    if (_cursor[r] < 0) _cursor[r] = _cols - 1;
+                    _cursor[s][r] += dir;
+                    if (_cursor[s][r] >= cols) _cursor[s][r] = 0;
+                    if (_cursor[s][r] < 0) _cursor[s][r] = cols - 1;
                 }
                 else
                 {
                     int wcells = wid[ci];
                     int at;
-                    if (_dir[r] > 0)
+                    if (dir > 0)
                     {
-                        if (_cursor[r] + wcells > _cols) _cursor[r] = 0;   // don't straddle the edge
-                        at = _cursor[r];
-                        _cursor[r] += wcells;
-                        if (_cursor[r] >= _cols) _cursor[r] = 0;
+                        if (_cursor[s][r] + wcells > cols) _cursor[s][r] = 0;   // don't straddle the edge
+                        at = _cursor[s][r];
+                        _cursor[s][r] += wcells;
+                        if (_cursor[s][r] >= cols) _cursor[s][r] = 0;
                     }
                     else
                     {
-                        if (_cursor[r] - wcells + 1 < 0) _cursor[r] = _cols - 1;
-                        at = _cursor[r] - wcells + 1;
-                        _cursor[r] -= wcells;
-                        if (_cursor[r] < 0) _cursor[r] = _cols - 1;
+                        if (_cursor[s][r] - wcells + 1 < 0) _cursor[s][r] = cols - 1;
+                        at = _cursor[s][r] - wcells + 1;
+                        _cursor[s][r] -= wcells;
+                        if (_cursor[s][r] < 0) _cursor[s][r] = cols - 1;
                     }
-                    DrawGlyph(ch, tier * 20 + (mask[ci] ? 1 : 0),
+                    DrawGlyph(tier, ch, tier * 20 + (mask[ci] ? 1 : 0),
                               mask[ci] ? _baseFill[tier] : _baseText[tier], null,
-                              at * _cellW, y, wcells);
-                    Mark(r, at, ch, wcells);
-                    PushHist(r, at, ch, mask[ci], (byte)wcells);
+                              at * cw, y, wcells);
+                    if (s == SetN) Mark(r, at, ch, wcells);
+                    PushHist(s, r, at, ch, mask[ci], (byte)wcells);
                 }
-                _idx[r]++;
+                _idx[s][r]++;
             }
 
             // Redraw the last few placements as a bright head ramp. Each cell is
             // erased first because the decode shimmer can show a DIFFERENT glyph
             // than the one committed underneath.
-            int cnt = _hCnt[r];
+            int cnt = _hCnt[s][r];
             for (int d = 0; d < cnt && d < Ramp; d++)
             {
-                int p = Mod(_hPos[r] - 1 - d, Ramp);
-                int wcells = _hW[r][p];
-                int x = _hCol[r][p] * _cellW;
-                _g.FillRectangle(Brushes.Black, x, y, wcells * _cellW, _cellH);
+                int p = Mod(_hPos[s][r] - 1 - d, Ramp);
+                int wcells = _hW[s][r][p];
+                int x = _hCol[s][r][p] * cw;
+                _g.FillRectangle(Brushes.Black, x, y, wcells * cw, chh);
 
-                char ch = (_decode && d < Scramble) ? ScrambleGlyph(wcells) : _hCh[r][p];
-                int style = tier * 20 + (_hFl[r][p] ? 10 : 2) + d;
-                Brush b = _hFl[r][p] ? _rampFill[tier][d] : _rampText[tier][d];
+                char ch = (_decode && d < Scramble) ? ScrambleGlyph(wcells) : _hCh[s][r][p];
+                int style = tier * 20 + (_hFl[s][r][p] ? 10 : 2) + d;
+                Brush b = _hFl[s][r][p] ? _rampFill[tier][d] : _rampText[tier][d];
 
                 // Near heads carry the full baked phosphor bloom; the far layer none.
                 Brush halo = (d == 0 && tier == 0) ? _glow : null;
-                DrawGlyph(ch, style, b, halo, x, y, wcells);
+                DrawGlyph(tier, ch, style, b, halo, x, y, wcells);
             }
         }
 
@@ -904,7 +928,7 @@ namespace MatrixSaver
         // feed the drops fall as full-width katakana gibberish (the film look).
         void SpawnDrop(int i)
         {
-            _dCol[i] = _rng.Next(0, Math.Max(1, _cols - 1));
+            _dCol[i] = _rng.Next(0, Math.Max(1, _colsT[1] - 1));
             _dSpd[i] = 0.12 + _rng.NextDouble() * 0.33;
             _dPos[i] = -(2.0 + _rng.NextDouble() * 30.0);    // delay before re-entering at the top
             _dIdx[i] = (int)Math.Floor(_dPos[i]);
@@ -923,6 +947,7 @@ namespace MatrixSaver
 
         void StepDrops(double dt)
         {
+            int cw = _cwT[1], chh = _chT[1], rows = _rowsT[1], cols = _colsT[1];
             for (int i = 0; i < _dropN; i++)
             {
                 _dPos[i] += _dSpd[i] * dt;
@@ -937,14 +962,13 @@ namespace MatrixSaver
                 {
                     int row = _dIdx[i]++;
                     if (row < 0) continue;
-                    if (row >= _rows + Ramp) { respawn = true; break; }
-                    if (row >= _rows) continue;
+                    if (row >= rows + Ramp) { respawn = true; break; }
+                    if (row >= rows) continue;
                     char ch = txt[Mod(row, L)];
                     if (ch == ' ') continue;
                     int w = W(ch);
-                    int col = Math.Min(_dCol[i], _cols - w);
-                    DrawGlyph(ch, 20, _baseText[1], null, col * _cellW, row * _cellH, w);
-                    Mark(row, col, ch, w);
+                    int col = Math.Min(_dCol[i], cols - w);
+                    DrawGlyph(1, ch, 20, _baseText[1], null, col * cw, row * chh, w);
                 }
                 if (respawn) { SpawnDrop(i); continue; }
 
@@ -953,15 +977,15 @@ namespace MatrixSaver
                 for (int d = 0; d < Ramp; d++)
                 {
                     int row = _dIdx[i] - 1 - d;
-                    if (row < 0 || row >= _rows) continue;
+                    if (row < 0 || row >= rows) continue;
                     char ch = txt[Mod(row, L)];
                     if (ch == ' ') continue;
                     int w = W(ch);
-                    int col = Math.Min(_dCol[i], _cols - w);
-                    _g.FillRectangle(Brushes.Black, col * _cellW, row * _cellH, w * _cellW, _cellH);
+                    int col = Math.Min(_dCol[i], cols - w);
+                    _g.FillRectangle(Brushes.Black, col * cw, row * chh, w * cw, chh);
                     char show = (_decode && d < Scramble) ? ScrambleGlyph(w) : ch;
-                    DrawGlyph(show, 20 + 2 + d, _rampText[1][d], d == 0 ? _glowMid : null,
-                              col * _cellW, row * _cellH, w);
+                    DrawGlyph(1, show, 20 + 2 + d, _rampText[1][d], d == 0 ? _glowMid : null,
+                              col * cw, row * chh, w);
                 }
             }
         }
@@ -1014,7 +1038,7 @@ namespace MatrixSaver
                     if (at + w > _cols) at = _cols - w;
 
                     bool core = m > 160;                     // solid ink vs anti-aliased edge
-                    DrawGlyph(ch, core ? StyleClock : StyleClockDim,
+                    DrawGlyph(0, ch, core ? StyleClock : StyleClockDim,
                               core ? _clockText : _clockEdge, core ? _glow : null,
                               at * _cellW, grow * _cellH, w);
                 }
@@ -1078,19 +1102,22 @@ namespace MatrixSaver
         Font ClockFont(float px)
         {
             try { return new Font("Arial", px, FontStyle.Bold, GraphicsUnit.Pixel); }
-            catch { return new Font(_font.FontFamily, px, FontStyle.Bold, GraphicsUnit.Pixel); }
+            catch { return new Font(_fontT[0].FontFamily, px, FontStyle.Bold, GraphicsUnit.Pixel); }
         }
 
         public void Prewarm(int frames) { for (int i = 0; i < frames; i++) Step(); }
 
         public void Dispose()
         {
-            _cache.Dispose();
+            for (int t = 0; t < Tiers; t++)
+            {
+                _cacheT[t].Dispose();
+                _fontT[t].Dispose();
+                _fontKRT[t].Dispose();
+                _fontRTLT[t].Dispose();
+            }
             _g.Dispose();
             _buffer.Dispose();
-            _font.Dispose();
-            _fontKR.Dispose();
-            _fontRTL.Dispose();
             _fade.Dispose();
             _glow.Dispose();
             _glowMid.Dispose();

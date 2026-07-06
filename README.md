@@ -38,6 +38,9 @@ glyphs take two cells):
   Arabic/Hebrew headlines scroll as dim far-layer tickers whose heads sweep
   **right-to-left**, characters upright in native order. Feeds are routed to
   layers automatically by script.
+- **Real perspective** — each layer renders at its own type size (mid ≈ 2/3,
+  far ≈ 1/2 of the foreground) on its own grid, darker with distance, so the
+  back layers actually sit farther away instead of being dimmer copies.
 - **Phosphor bloom** — foreground heads radiate a three-ring baked-in glow halo,
   the falling columns a softer one (free at runtime — it lives in the glyph cache).
 - **The rain converges into a clock** — at the top of each minute the characters
@@ -109,9 +112,10 @@ copy the file to a `.exe` name and invoke that directly.
 - **Theme colors** — the palette table in `Theme.Get` (head flash / settled text / filler).
 - **Trail length** — the alpha of `_fade` (lower = longer-lived text).
 - **Head ramp length** — the `Ramp` constant; **shimmer duration** — `Scramble`.
-- **Depth** — the `TierDim` table (how dark each layer is) and the 60/40 row split
-  in the constructor; **bloom strength** — the `_glow` / `_glowMid` alphas;
-  **vertical column density** — `_dropN` (default one drop per 5 columns).
+- **Depth** — the `TierDim` table (how dark each layer is), the per-tier type
+  `sizes` table, and the 0.55/0.90 row-activation odds in the constructor;
+  **bloom strength** — the `_glow` / `_glowMid` alphas; **vertical column
+  density** — `_dropN` (default one drop per 5 mid-grid columns).
 - **Clock size** — the `_rows * 0.40` height and `0.80` width caps in
   `BuildClockMask`; **legibility thresholds** — the `90`/`160` ink cutoffs.
 - **Sweep speed** — the `_speed[r]` ranges in the constructor.
