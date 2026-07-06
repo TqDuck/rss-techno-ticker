@@ -27,9 +27,9 @@ These render perfectly on the screensaver's grid.
 | Turkish alt| ShiftDelete       | https://shiftdelete.net/feed                      | ~20   |
 | Turkish alt| Webrazzi          | https://webrazzi.com/feed/                        | ~20   |
 
-> Middle East note: **Turkish** is the Middle Eastern option that aligns today
-> (Latin script — verified, including ı ğ ş ç ö ü). Arabic / Hebrew / Persian are
-> right-to-left, so they're in the "needs work" bucket below.
+> Middle East note: **Turkish** is Latin-script and rides the foreground tickers
+> (verified, including ı ğ ş ç ö ü). Arabic / Hebrew / Persian are right-to-left
+> and get their own layer — see the RTL section below.
 
 > Swahili note: dedicated Swahili-only *tech* blogs with RSS are scarce. BBC
 > Swahili is general news but regularly covers Sayansi & Teknolojia, it's very
@@ -49,18 +49,20 @@ else uses MS Gothic (with system font-linking for Simplified Chinese).
 | Mandarin (Simplified, mainland)| 少数派 (sspai)         | https://sspai.com/feed                              | ~10   |
 | Mandarin (Traditional, Taiwan) | 科技新報 (TechNews)    | https://technews.tw/feed/                           | ~40   |
 
-### Right-to-left — rendered upside-down (flip your monitor to read) 🙃
-These render upside-down on purpose: flip the display 180° and they turn upright
-and read right-to-left correctly (your LTR feeds go upside-down then). Hebrew is
-fully correct; Arabic/Persian letters aren't joined (no shaping engine).
+### Right-to-left — native direction on the far layer ✅
+RTL feeds are auto-routed to the far depth layer, where ticker heads sweep
+**right-to-left** so the text reads in its native order (embedded Latin/digit
+runs are bidi-corrected). Hebrew is fully correct; Arabic/Persian letters render
+in isolated forms (no shaping engine).
 
-| Language | Blog            | Feed URL                          | Items |
-|----------|-----------------|-----------------------------------|-------|
-| Hebrew   | Geektime        | https://www.geektime.co.il/feed/  | ~30   |
-| Persian  | Zoomit          | https://www.zoomit.ir/feed/       | ~50   |
+| Language | Blog            | Feed URL                               | Items |
+|----------|-----------------|----------------------------------------|-------|
+| Arabic   | BBC Arabic      | https://feeds.bbci.co.uk/arabic/rss.xml | ~30  |
+| Hebrew   | Geektime        | https://www.geektime.co.il/feed/       | ~30   |
+| Persian  | Zoomit          | https://www.zoomit.ir/feed/            | ~50   |
 
-Arabic: common feeds (aitnews, aittech) block automated requests — findable if
-you want one.
+BBC Arabic is general news (tech-only Arabic feeds like aitnews block automated
+requests); Geektime and Zoomit are proper tech blogs.
 
 ### Notes on the Chinese variants
 Written Chinese is largely shared, so the real distinction is region/script, not
