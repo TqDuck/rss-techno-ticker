@@ -31,14 +31,21 @@ glyphs take two cells):
 - **Five color themes** — Matrix Green, Amber CRT, Ice Blue, Ghost White, Crimson.
 - **Decode effect** — each new character flickers through random glyphs for a few
   frames before resolving into the real letter (toggleable).
-- **Depth layers** — three tiers of rows (bright fast foreground, mid-ground, dim
-  slow background), long luminous trails, and a faint ambient dust of glyphs
-  twinkling in the dark between tickers, for a dense layered-parallax feel.
+- **Three depth layers, each in its script's native direction** — bright LTR
+  tickers sweep left-to-right in front; Chinese/Japanese headlines **fall
+  top-down** as vertical mid-ground columns (their traditional reading
+  direction — katakana gibberish stands in if you have no CJK feed); and
+  Arabic/Hebrew headlines scroll as dim far-layer tickers whose heads sweep
+  **right-to-left**, characters upright in native order. Feeds are routed to
+  layers automatically by script.
 - **Phosphor bloom** — foreground heads radiate a three-ring baked-in glow halo,
-  mid-tier heads a softer one (free at runtime — it lives in the glyph cache).
-- **A clock made of rain** — at the top of each minute, HH:MM assembles at screen
-  centre as dot-matrix digits whose every dot is a shimmering katakana glyph;
-  it glows for a few seconds, then dissolves back into the fade (toggleable).
+  the falling columns a softer one (free at runtime — it lives in the glyph cache).
+- **The rain converges into a clock** — at the top of each minute the characters
+  already on screen inside the shape of HH:MM re-illuminate brighter (gaps fill
+  with fresh glyphs), so the code itself arranges into the time. The digit shapes
+  come from a real font sampled per grid cell — smooth, not blocky — and live
+  tickers keep writing straight through them, so the time shimmers with actual
+  headlines until the fade melts it back into rain (toggleable).
 - **Settings dialog** — add/remove feed URLs, **Test all** to health-check every
   feed (item count or the exact failure), cap or uncap description length,
   toggle the katakana filler, pick a theme, toggle the decode effect and the
@@ -65,15 +72,12 @@ open **Configure** to replace it with anything you like.
 ## Language support
 | Scripts | How they render |
 |---|---|
-| Latin & Cyrillic (English, German, French, Spanish, Portuguese, Turkish, Russian, Swahili, …) | Perfectly aligned |
-| CJK (Japanese, Korean, Chinese) | Aligned — full-width glyphs span two cells; Korean via Malgun Gothic |
-| RTL (Hebrew, Arabic, Persian) | Rendered **upside-down on purpose** 🙃 |
+| Latin & Cyrillic (English, German, French, Spanish, Portuguese, Turkish, Russian, Swahili, …) | Foreground tickers, left-to-right |
+| CJK (Japanese, Korean, Chinese) | **Vertical columns falling top-down** — the traditional reading direction; full-width glyphs span two cells; Korean via Malgun Gothic |
+| RTL (Hebrew, Arabic, Persian) | Far-layer tickers scrolling **right-to-left** in native order; embedded Latin/digit runs are bidi-corrected |
 
-The RTL trick: flip your monitor 180° and the per-glyph 180° rotation turns the
-text upright *while* the left-to-right layout becomes right-to-left — so it reads
-correctly. (Your LTR feeds go upside-down instead. That's the trade.) Hebrew comes
-out fully correct; Arabic/Persian letters render in isolated forms since there's
-no shaping engine.
+Hebrew comes out fully correct; Arabic/Persian letters render in isolated forms
+since there's no shaping engine (which suits the one-glyph-per-cell grid anyway).
 
 ## Build from source
 No IDE or SDK needed — the compiler ships with Windows:
@@ -105,9 +109,11 @@ copy the file to a `.exe` name and invoke that directly.
 - **Theme colors** — the palette table in `Theme.Get` (head flash / settled text / filler).
 - **Trail length** — the alpha of `_fade` (lower = longer-lived text).
 - **Head ramp length** — the `Ramp` constant; **shimmer duration** — `Scramble`.
-- **Depth** — the `TierDim` table (how dark each tier is) and the 40/30/30 tier
-  split in the constructor; **bloom strength** — the `_glow` / `_glowMid` alphas;
-  **dust density** — the `specks` count in `Step`.
+- **Depth** — the `TierDim` table (how dark each layer is) and the 60/40 row split
+  in the constructor; **bloom strength** — the `_glow` / `_glowMid` alphas;
+  **vertical column density** — `_dropN` (default one drop per 5 columns).
+- **Clock size** — the `_rows * 0.40` height and `0.80` width caps in
+  `BuildClockMask`; **legibility thresholds** — the `90`/`160` ink cutoffs.
 - **Sweep speed** — the `_speed[r]` ranges in the constructor.
 - **Text size** — `fontSize` in `MatrixForm.OnLoad` (18 full-screen, 11 preview).
 

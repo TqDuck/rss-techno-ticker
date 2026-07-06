@@ -324,8 +324,8 @@ namespace MatrixSaver
     // ---- Glyph atlas cache ----
     // GDI+ DrawString rasterizes the outline on every call and is the frame's hot
     // path. Instead, each distinct (character, style) pair is drawn ONCE into a
-    // shared sheet bitmap — RTL rotation baked in — and every frame after that is
-    // a plain 1:1 blit. Sheets grow on demand via a simple shelf packer.
+    // shared sheet bitmap and every frame after that is a plain 1:1 blit. Sheets
+    // grow on demand via a simple shelf packer.
     class GlyphCache : IDisposable
     {
         const int SheetW = 1024, SheetH = 512;
@@ -344,17 +344,17 @@ namespace MatrixSaver
 
         // halo, when given, is baked INTO the cached pixels as a soft bloom around
         // the glyph — so a glowing head costs exactly one blit at runtime.
-        public void Draw(Graphics g, char ch, int style, Font font, bool rtl, Brush brush,
+        public void Draw(Graphics g, char ch, int style, Font font, Brush brush,
                          Brush halo, int x, int y, int wcells)
         {
             int key = ch | (style << 16);
             Slot s;
-            if (!_slots.TryGetValue(key, out s)) s = Rasterize(key, ch, font, rtl, brush, halo, wcells);
+            if (!_slots.TryGetValue(key, out s)) s = Rasterize(key, ch, font, brush, halo, wcells);
             g.DrawImage(_sheets[s.Sheet], new Rectangle(x - Bleed, y - Bleed, s.W, s.H),
                         s.X, s.Y, s.W, s.H, GraphicsUnit.Pixel);
         }
 
-        Slot Rasterize(int key, char ch, Font font, bool rtl, Brush brush, Brush halo, int wcells)
+        Slot Rasterize(int key, char ch, Font font, Brush brush, Brush halo, int wcells)
         {
             int w = wcells * _cellW + 2 * Bleed, h = _cellH + 2 * Bleed;
             if (_sheets.Count == 0) NewSheet();
@@ -369,17 +369,17 @@ namespace MatrixSaver
                 // and thin out with distance, approximating a phosphor bloom falloff.
                 for (int dx = -1; dx <= 1; dx++)
                     for (int dy = -1; dy <= 1; dy++)
-                        if (dx != 0 || dy != 0) DrawOne(ch, font, rtl, halo, gx + dx, gy + dy);
-                DrawOne(ch, font, rtl, halo, gx - 2, gy);
-                DrawOne(ch, font, rtl, halo, gx + 2, gy);
-                DrawOne(ch, font, rtl, halo, gx, gy - 2);
-                DrawOne(ch, font, rtl, halo, gx, gy + 2);
-                DrawOne(ch, font, rtl, halo, gx - 3, gy);
-                DrawOne(ch, font, rtl, halo, gx + 3, gy);
-                DrawOne(ch, font, rtl, halo, gx, gy - 3);
-                DrawOne(ch, font, rtl, halo, gx, gy + 3);
+                        if (dx != 0 || dy != 0) DrawOne(ch, font, halo, gx + dx, gy + dy);
+                DrawOne(ch, font, halo, gx - 2, gy);
+                DrawOne(ch, font, halo, gx + 2, gy);
+                DrawOne(ch, font, halo, gx, gy - 2);
+                DrawOne(ch, font, halo, gx, gy + 2);
+                DrawOne(ch, font, halo, gx - 3, gy);
+                DrawOne(ch, font, halo, gx + 3, gy);
+                DrawOne(ch, font, halo, gx, gy - 3);
+                DrawOne(ch, font, halo, gx, gy + 3);
             }
-            DrawOne(ch, font, rtl, brush, gx, gy);
+            DrawOne(ch, font, brush, gx, gy);
 
             var s = new Slot { Sheet = _sheets.Count - 1, X = _x, Y = _y, W = w, H = h };
             _slots[key] = s;
@@ -387,23 +387,9 @@ namespace MatrixSaver
             return s;
         }
 
-        void DrawOne(char ch, Font font, bool rtl, Brush brush, float gx, float gy)
+        void DrawOne(char ch, Font font, Brush brush, float gx, float gy)
         {
-            if (rtl)
-            {
-                // Rotate 180° about the cell centre (see IsRtl for why).
-                float cx = gx + _cellW * 0.5f, cy = gy + _cellH * 0.5f;
-                var st = _sg.Save();
-                _sg.TranslateTransform(cx, cy);
-                _sg.RotateTransform(180f);
-                _sg.TranslateTransform(-cx, -cy);
-                _sg.DrawString(ch.ToString(), font, brush, gx, gy);
-                _sg.Restore(st);
-            }
-            else
-            {
-                _sg.DrawString(ch.ToString(), font, brush, gx, gy);
-            }
+            _sg.DrawString(ch.ToString(), font, brush, gx, gy);
         }
 
         const int MaxSheets = 24;   // ~24 MB; a huge CJK vocabulary can't grow unbounded
@@ -436,11 +422,14 @@ namespace MatrixSaver
         }
     }
 
-    // ---- The render engine: full-width horizontal tickers with Matrix illumination ----
-    // Each row owns an endless ribbon (feed segments + gap filler). A bright head
-    // sweeps left-to-right, wrapping forever. The head flashes in the theme's head
-    // colour and ramps to the settled colour over a few characters; a translucent
-    // black wash then carries everything toward black.
+    // ---- The render engine: three depth layers, each in its script's native direction ----
+    //   near (bright) : LTR headlines as horizontal tickers, heads sweeping left-to-right
+    //   mid           : CJK headlines FALLING top-down as vertical columns (their
+    //                   traditional reading direction); katakana gibberish if no CJK feed
+    //   far (dim)     : RTL headlines (Arabic/Hebrew) as tickers whose heads sweep
+    //                   right-to-left, characters upright in native order
+    // A bright head flashes in the theme's head colour and ramps to the settled colour
+    // over a few characters; a translucent black wash carries everything toward black.
     //
     // Layout is variable-width: a full-width CJK glyph occupies TWO grid cells, so
     // Japanese/Korean/Chinese line up with half-width Latin/Cyrillic on the same grid.
@@ -448,14 +437,14 @@ namespace MatrixSaver
     {
         const int Ramp = 6;          // bright comet tail length behind each head
         const int Scramble = 2;      // how many of the newest placements shimmer (decode effect)
-        const int Tiers = 3;         // depth layers: 0 near (bright), 1 mid, 2 far (dim, slow)
+        const int Tiers = 3;         // 0 near LTR rows, 1 mid vertical CJK, 2 far RTL rows
         static readonly double[] TierDim = { 0.0, 0.30, 0.55 };
 
         // Glyph-cache style ids: tier*20 + {0 text, 1 fill, 2..2+Ramp rampText,
-        // 10..10+Ramp rampFill}; then the specials below. A style is just "which
-        // brush(es)", so cached pixels can be reused.
-        const int StyleDust = 70;
-        const int StyleClock = 71;
+        // 10..10+Ramp rampFill}; then the clock specials below. A style is just
+        // "which brush(es)", so cached pixels can be reused.
+        const int StyleClock = 70;      // bright core of the converged time
+        const int StyleClockDim = 71;   // softer anti-aliased edge of the digits
 
         readonly Random _rng = new Random();
         readonly Bitmap _buffer;
@@ -486,27 +475,38 @@ namespace MatrixSaver
         readonly int[] _hCnt;
 
         volatile List<string> _pool;
+        List<string> _poolLtr, _poolCjk, _poolRtl;   // the pool split by script
 
-        // Depth: tier 0 rows are the foreground; deeper tiers are dimmer and slower,
+        // Depth: tier 0 rows are the foreground; the far tier is dimmer and slower,
         // as if the rain continues behind the front layer.
         readonly byte[] _tier;
+        readonly int[] _dir;         // +1 head sweeps left-to-right, -1 right-to-left
         readonly bool _decode;
+
+        // What character currently occupies each grid cell ('\x01' marks the second
+        // cell of a wide glyph) — this is what lets the clock re-illuminate the rain.
+        readonly char[] _scr;
+
+        // The mid-depth vertical layer: CJK text falling top-down, one drop per column.
+        int _dropN;
+        int[] _dCol; double[] _dPos, _dSpd; int[] _dIdx; string[] _dTxt;
 
         readonly SolidBrush _fade = new SolidBrush(Color.FromArgb(12, 0, 0, 0));
         readonly SolidBrush _glow;                                     // baked head bloom (near)
         readonly SolidBrush _glowMid;                                  // softer bloom (mid tier)
-        readonly SolidBrush _dust;                                     // ambient background twinkle
         readonly SolidBrush[] _baseText = new SolidBrush[Tiers];
         readonly SolidBrush[] _baseFill = new SolidBrush[Tiers];
         readonly SolidBrush[][] _rampText = new SolidBrush[Tiers][];   // [tier][depth]
         readonly SolidBrush[][] _rampFill = new SolidBrush[Tiers][];
 
-        // The clock that materializes out of the rain at the top of each minute.
+        // The clock the rain converges into at the top of each minute.
         readonly bool _clockOn;
         public bool ForceClock;      // harness /dump verification only
-        readonly SolidBrush _clockText, _clockPlate;
+        readonly SolidBrush _clockText, _clockEdge, _clockPlate;
         int _clockMinute = -1;
-        char[] _clockCells;          // the shimmering glyphs the digits are made of
+        byte[] _ckMask;              // per-cell ink coverage of the current HH:MM
+        char[] _ckFill;              // fresh glyphs for lit cells the rain left empty
+        int _ckGw, _ckGh, _ckC0, _ckR0;
 
         public Bitmap Buffer { get { return _buffer; } }
 
@@ -540,10 +540,10 @@ namespace MatrixSaver
             _decode = Settings.Decode;
             _glow = new SolidBrush(Color.FromArgb(52, th.Head));
             _glowMid = new SolidBrush(Color.FromArgb(24, th.Head));
-            _dust = new SolidBrush(Color.FromArgb(80, Lerp(th.Fill, Color.Black, 0.35)));
             _clockOn = Settings.Clock;
-            _clockText = new SolidBrush(Lerp(th.Head, th.Text, 0.45));
-            _clockPlate = new SolidBrush(Color.FromArgb(100, 0, 0, 0));
+            _clockText = new SolidBrush(Lerp(th.Head, th.Text, 0.40));
+            _clockEdge = new SolidBrush(th.Text);
+            _clockPlate = new SolidBrush(Color.FromArgb(90, 0, 0, 0));
             for (int tier = 0; tier < Tiers; tier++)
             {
                 double dim = TierDim[tier];
@@ -576,13 +576,15 @@ namespace MatrixSaver
             _hPos = new int[_rows];
             _hCnt = new int[_rows];
             _tier = new byte[_rows];
+            _dir = new int[_rows];
+            _scr = new char[_rows * _cols];
+            ClassifyPool();
             for (int r = 0; r < _rows; r++)
             {
-                BuildRibbon(r);
                 double dz = _rng.NextDouble();
-                _tier[r] = dz < 0.40 ? (byte)0 : dz < 0.70 ? (byte)1 : (byte)2;
+                _tier[r] = dz < 0.60 ? (byte)0 : (byte)2;   // rows are near or far; mid is vertical
+                BuildRibbon(r);
                 _speed[r] = _tier[r] == 0 ? 0.45 + _rng.NextDouble() * 1.05
-                          : _tier[r] == 1 ? 0.28 + _rng.NextDouble() * 0.62
                                           : 0.14 + _rng.NextDouble() * 0.34;
                 _pos[r] = _rng.Next(0, Math.Max(1, _ribbon[r].Length));
                 _idx[r] = (int)Math.Floor(_pos[r]);
@@ -592,18 +594,84 @@ namespace MatrixSaver
                 _hFl[r] = new bool[Ramp];
                 _hW[r] = new byte[Ramp];
             }
+
+            _dropN = Math.Max(2, _cols / 5);
+            _dCol = new int[_dropN];
+            _dPos = new double[_dropN];
+            _dSpd = new double[_dropN];
+            _dIdx = new int[_dropN];
+            _dTxt = new string[_dropN];
+            for (int i = 0; i < _dropN; i++)
+            {
+                SpawnDrop(i);
+                // Stagger the first cycle so drops don't all start at the top edge.
+                _dPos[i] = -_rng.NextDouble() * _rows * 2;
+                _dIdx[i] = (int)Math.Floor(_dPos[i]);
+            }
         }
 
         public void SetPool(List<string> pool)
         {
             if (pool == null || pool.Count == 0) return;
             _pool = pool;
+            ClassifyPool();
             for (int r = 0; r < _rows; r++) BuildRibbon(r);
+        }
+
+        // Split the pool by script so each depth layer can show text in its native
+        // reading direction. Thresholds are loose because feed items mix scripts
+        // ("Title :: English description" under a Japanese headline, etc).
+        void ClassifyPool()
+        {
+            _poolLtr = new List<string>();
+            _poolCjk = new List<string>();
+            _poolRtl = new List<string>();
+            foreach (string s in _pool)
+            {
+                int wide = 0, rtl = 0, n = 0;
+                foreach (char c in s)
+                {
+                    if (c <= ' ') continue;
+                    n++;
+                    if (IsWide(c)) wide++;
+                    else if (IsRtl(c)) rtl++;
+                }
+                if (n == 0) continue;
+                if (rtl * 4 > n) _poolRtl.Add(BidiFix(s));
+                else if (wide * 10 > n * 3) _poolCjk.Add(s);
+                else _poolLtr.Add(s);
+            }
+        }
+
+        // RTL tickers lay successive characters leftward — correct for Arabic and
+        // Hebrew, but it mirrors any embedded Latin/digit run, so pre-reverse those
+        // runs to cancel it out.
+        static string BidiFix(string s)
+        {
+            char[] a = s.ToCharArray();
+            int i = 0;
+            while (i < a.Length)
+            {
+                if (!IsRtl(a[i]) && a[i] != ' ')
+                {
+                    int j = i;
+                    while (j < a.Length && !IsRtl(a[j]) && a[j] != ' ') j++;
+                    Array.Reverse(a, i, j - i);
+                    i = j;
+                }
+                else i++;
+            }
+            return new string(a);
         }
 
         void BuildRibbon(int r)
         {
-            var p = _pool;
+            bool rtl = _tier[r] == 2 && _poolRtl.Count > 0;
+            _dir[r] = rtl ? -1 : 1;
+            List<string> p = rtl ? _poolRtl
+                           : _poolLtr.Count > 0 ? _poolLtr
+                           : _poolCjk.Count > 0 ? _poolCjk
+                           : new List<string>(Feed.Fallback);
             var sb = new StringBuilder();
             var mask = new List<bool>();
             var wid = new List<byte>();
@@ -617,7 +685,11 @@ namespace MatrixSaver
                 if (Settings.Filler)
                 {
                     int gap = 3 + _rng.Next(0, 16);
-                    for (int i = 0; i < gap; i++) { char g = Gib(); sb.Append(g); mask.Add(true); wid.Add(W(g)); }
+                    for (int i = 0; i < gap; i++)
+                    {
+                        char g = rtl ? RtlGib() : Gib();
+                        sb.Append(g); mask.Add(true); wid.Add(W(g));
+                    }
                 }
                 else
                 {
@@ -634,6 +706,17 @@ namespace MatrixSaver
         {
             int k = _rng.Next(0, 100);
             if (k < 78) return (char)(0xFF66 + _rng.Next(0, 0xFF9D - 0xFF66 + 1)); // half-width katakana
+            if (k < 90) return (char)('0' + _rng.Next(0, 10));
+            const string sym = "<>/*:=+#@$%";
+            return sym[_rng.Next(sym.Length)];
+        }
+
+        // Gap filler for the RTL layer: Arabic letters instead of katakana, so the
+        // far tickers stay visually coherent with their headlines.
+        char RtlGib()
+        {
+            int k = _rng.Next(0, 100);
+            if (k < 70) return (char)(0x0627 + _rng.Next(0, 0x064A - 0x0627 + 1));
             if (k < 90) return (char)('0' + _rng.Next(0, 10));
             const string sym = "<>/*:=+#@$%";
             return sym[_rng.Next(sym.Length)];
@@ -665,10 +748,10 @@ namespace MatrixSaver
             return _font;
         }
 
-        // Hebrew / Arabic / Persian. We can't do real RTL+shaping, so instead we draw
-        // these glyphs upside-down: flip your monitor 180° and a 180° per-glyph rotation
-        // becomes upright AND the left-to-right layout reads right-to-left. (LTR text
-        // then reads upside-down — that's the deal.)
+        // Hebrew / Arabic / Persian — routes segments to the RTL layer, where heads
+        // sweep right-to-left so successive characters appear in their native order.
+        // (No shaping: Arabic letters render in isolated form, which suits the
+        // one-glyph-per-cell Matrix grid anyway.)
         static bool IsRtl(char c)
         {
             return (c >= 0x0590 && c <= 0x05FF) ||  // Hebrew
@@ -680,11 +763,19 @@ namespace MatrixSaver
                    (c >= 0xFE70 && c <= 0xFEFF);    // Arabic presentation forms B
         }
 
-        // Draw one glyph via the atlas cache; RTL rotation (and the bloom halo, when
-        // given) are baked into the cached pixels, so runtime cost is a single blit.
+        // Draw one glyph via the atlas cache; the bloom halo, when given, is baked
+        // into the cached pixels, so runtime cost is a single blit.
         void DrawGlyph(char ch, int style, Brush b, Brush halo, int x, int y, int wcells)
         {
-            _cache.Draw(_g, ch, style, FontFor(ch), IsRtl(ch), b, halo, x, y, wcells);
+            _cache.Draw(_g, ch, style, FontFor(ch), b, halo, x, y, wcells);
+        }
+
+        // Record what occupies a grid cell so the clock can re-illuminate the rain.
+        void Mark(int row, int col, char ch, int w)
+        {
+            int b = row * _cols + col;
+            _scr[b] = ch;
+            if (w == 2 && col + 1 < _cols) _scr[b + 1] = '\x01';
         }
 
         static Color Lerp(Color a, Color b, double t)
@@ -717,75 +808,16 @@ namespace MatrixSaver
 
         // dt is in "frames" (1.0 = the nominal 33 ms tick). A late timer tick passes
         // dt > 1 so the rain covers the same distance it would have at full rate.
+        // Layers draw far-to-near so same-frame overlaps resolve like real depth.
         public void Step(double dt)
         {
             int fa = (int)Math.Round(12 * dt);               // fade keeps pace with time
             _fade.Color = Color.FromArgb(Math.Max(3, Math.Min(60, fa)), 0, 0, 0);
             _g.FillRectangle(_fade, 0, 0, _buffer.Width, _buffer.Height);
 
-            for (int r = 0; r < _rows; r++)
-            {
-                _pos[r] += _speed[r] * dt;
-                int target = (int)Math.Floor(_pos[r]);
-                string rib = _ribbon[r];
-                bool[] mask = _filler[r];
-                byte[] wid = _wide[r];
-                int L = rib.Length;
-                int y = r * _cellH;
-                int tier = _tier[r];
-
-                // Commit each newly reached character at its settled colour, advancing
-                // the column cursor by the character's width and wrapping at the edge.
-                while (_idx[r] < target)
-                {
-                    int ci = Mod(_idx[r], L);
-                    char ch = rib[ci];
-                    if (ch == ' ')
-                    {
-                        if (++_cursor[r] >= _cols) _cursor[r] = 0;
-                    }
-                    else
-                    {
-                        int wcells = wid[ci];
-                        if (_cursor[r] + wcells > _cols) _cursor[r] = 0;   // don't straddle the edge
-                        DrawGlyph(ch, tier * 20 + (mask[ci] ? 1 : 0),
-                                  mask[ci] ? _baseFill[tier] : _baseText[tier], null,
-                                  _cursor[r] * _cellW, y, wcells);
-                        PushHist(r, _cursor[r], ch, mask[ci], (byte)wcells);
-                        _cursor[r] += wcells;
-                        if (_cursor[r] >= _cols) _cursor[r] = 0;
-                    }
-                    _idx[r]++;
-                }
-
-                // Redraw the last few placements as a bright head ramp. Each cell is
-                // erased first because the decode shimmer can show a DIFFERENT glyph
-                // than the one committed underneath.
-                int cnt = _hCnt[r];
-                for (int d = 0; d < cnt && d < Ramp; d++)
-                {
-                    int p = Mod(_hPos[r] - 1 - d, Ramp);
-                    int wcells = _hW[r][p];
-                    int x = _hCol[r][p] * _cellW;
-                    _g.FillRectangle(Brushes.Black, x, y, wcells * _cellW, _cellH);
-
-                    char ch = (_decode && d < Scramble) ? ScrambleGlyph(wcells) : _hCh[r][p];
-                    int style = tier * 20 + (_hFl[r][p] ? 10 : 2) + d;
-                    Brush b = _hFl[r][p] ? _rampFill[tier][d] : _rampText[tier][d];
-
-                    // Heads carry a baked phosphor bloom (still one blit): strong on
-                    // the near tier, soft on mid, none in the far dark.
-                    Brush halo = d != 0 ? null : tier == 0 ? _glow : tier == 1 ? _glowMid : null;
-                    DrawGlyph(ch, style, b, halo, x, y, wcells);
-                }
-            }
-
-            // Ambient dust: faint translucent glyphs twinkling in the void between
-            // tickers, so the dark behind the frontline reads as depth, not absence.
-            int specks = (int)Math.Ceiling(_rows * 0.5 * dt);
-            for (int i = 0; i < specks; i++)
-                DrawGlyph(Gib(), StyleDust, _dust, null,
-                          _rng.Next(_cols) * _cellW, _rng.Next(_rows) * _cellH, 1);
+            for (int r = 0; r < _rows; r++) if (_tier[r] == 2) StepRow(r, dt);
+            StepDrops(dt);
+            for (int r = 0; r < _rows; r++) if (_tier[r] == 0) StepRow(r, dt);
 
             if (_clockOn)
             {
@@ -795,85 +827,258 @@ namespace MatrixSaver
             }
         }
 
-        // 5x7 dot-matrix shapes for 0-9 (the colon is 2 wide). The clock is drawn as
-        // RAIN — each lit dot is a shimmering katakana/digit glyph on the same grid
-        // as the tickers, so the time looks like the code arranging itself.
-        static readonly string[][] DigitShapes =
+        void StepRow(int r, double dt)
         {
-            new[]{" ### ","#   #","#  ##","# # #","##  #","#   #"," ### "},
-            new[]{"  #  "," ##  ","  #  ","  #  ","  #  ","  #  "," ### "},
-            new[]{" ### ","#   #","    #","   # ","  #  "," #   ","#####"},
-            new[]{" ### ","#   #","    #","  ## ","    #","#   #"," ### "},
-            new[]{"   # ","  ## "," # # ","#  # ","#####","   # ","   # "},
-            new[]{"#####","#    ","#### ","    #","    #","#   #"," ### "},
-            new[]{" ### ","#    ","#    ","#### ","#   #","#   #"," ### "},
-            new[]{"#####","    #","   # ","  #  "," #   "," #   "," #   "},
-            new[]{" ### ","#   #","#   #"," ### ","#   #","#   #"," ### "},
-            new[]{" ### ","#   #","#   #"," ####","    #","    #"," ### "},
-        };
-        static readonly string[] ColonShape = { "  ", "##", "##", "  ", "##", "##", "  " };
+            _pos[r] += _speed[r] * dt;
+            int target = (int)Math.Floor(_pos[r]);
+            string rib = _ribbon[r];
+            bool[] mask = _filler[r];
+            byte[] wid = _wide[r];
+            int L = rib.Length;
+            int y = r * _cellH;
+            int tier = _tier[r];
 
-        // HH:MM materializes at screen centre at the top of each minute: lit dots
-        // assemble in a random scatter, each dot a glowing glyph that keeps
-        // shimmering while the clock is up; then the fade wash melts it back in.
+            // Commit each newly reached character at its settled colour, advancing
+            // the column cursor by the character's width — leftward on RTL rows —
+            // and wrapping at the edge.
+            while (_idx[r] < target)
+            {
+                int ci = Mod(_idx[r], L);
+                char ch = rib[ci];
+                if (ch == ' ')
+                {
+                    _cursor[r] += _dir[r];
+                    if (_cursor[r] >= _cols) _cursor[r] = 0;
+                    if (_cursor[r] < 0) _cursor[r] = _cols - 1;
+                }
+                else
+                {
+                    int wcells = wid[ci];
+                    int at;
+                    if (_dir[r] > 0)
+                    {
+                        if (_cursor[r] + wcells > _cols) _cursor[r] = 0;   // don't straddle the edge
+                        at = _cursor[r];
+                        _cursor[r] += wcells;
+                        if (_cursor[r] >= _cols) _cursor[r] = 0;
+                    }
+                    else
+                    {
+                        if (_cursor[r] - wcells + 1 < 0) _cursor[r] = _cols - 1;
+                        at = _cursor[r] - wcells + 1;
+                        _cursor[r] -= wcells;
+                        if (_cursor[r] < 0) _cursor[r] = _cols - 1;
+                    }
+                    DrawGlyph(ch, tier * 20 + (mask[ci] ? 1 : 0),
+                              mask[ci] ? _baseFill[tier] : _baseText[tier], null,
+                              at * _cellW, y, wcells);
+                    Mark(r, at, ch, wcells);
+                    PushHist(r, at, ch, mask[ci], (byte)wcells);
+                }
+                _idx[r]++;
+            }
+
+            // Redraw the last few placements as a bright head ramp. Each cell is
+            // erased first because the decode shimmer can show a DIFFERENT glyph
+            // than the one committed underneath.
+            int cnt = _hCnt[r];
+            for (int d = 0; d < cnt && d < Ramp; d++)
+            {
+                int p = Mod(_hPos[r] - 1 - d, Ramp);
+                int wcells = _hW[r][p];
+                int x = _hCol[r][p] * _cellW;
+                _g.FillRectangle(Brushes.Black, x, y, wcells * _cellW, _cellH);
+
+                char ch = (_decode && d < Scramble) ? ScrambleGlyph(wcells) : _hCh[r][p];
+                int style = tier * 20 + (_hFl[r][p] ? 10 : 2) + d;
+                Brush b = _hFl[r][p] ? _rampFill[tier][d] : _rampText[tier][d];
+
+                // Near heads carry the full baked phosphor bloom; the far layer none.
+                Brush halo = (d == 0 && tier == 0) ? _glow : null;
+                DrawGlyph(ch, style, b, halo, x, y, wcells);
+            }
+        }
+
+        // The mid depth layer: Chinese/Japanese headlines falling top-down, one
+        // glyph per row, in their native vertical reading direction. Without a CJK
+        // feed the drops fall as full-width katakana gibberish (the film look).
+        void SpawnDrop(int i)
+        {
+            _dCol[i] = _rng.Next(0, Math.Max(1, _cols - 1));
+            _dSpd[i] = 0.12 + _rng.NextDouble() * 0.33;
+            _dPos[i] = -(2.0 + _rng.NextDouble() * 30.0);    // delay before re-entering at the top
+            _dIdx[i] = (int)Math.Floor(_dPos[i]);
+            var cjk = _poolCjk;
+            if (cjk != null && cjk.Count > 0)
+                _dTxt[i] = cjk[_rng.Next(cjk.Count)];
+            else
+            {
+                var sb = new StringBuilder();
+                int n = 24 + _rng.Next(40);
+                for (int k = 0; k < n; k++)
+                    sb.Append((char)(0x30A1 + _rng.Next(0, 0x30FA - 0x30A1 + 1)));
+                _dTxt[i] = sb.ToString();
+            }
+        }
+
+        void StepDrops(double dt)
+        {
+            for (int i = 0; i < _dropN; i++)
+            {
+                _dPos[i] += _dSpd[i] * dt;
+                int target = (int)Math.Floor(_dPos[i]);
+                string txt = _dTxt[i];
+                int L = txt.Length;
+                bool respawn = false;
+
+                // Commit newly reached characters at the settled mid-tier colour.
+                // Character index == row, so the text reads top-to-bottom.
+                while (_dIdx[i] < target)
+                {
+                    int row = _dIdx[i]++;
+                    if (row < 0) continue;
+                    if (row >= _rows + Ramp) { respawn = true; break; }
+                    if (row >= _rows) continue;
+                    char ch = txt[Mod(row, L)];
+                    if (ch == ' ') continue;
+                    int w = W(ch);
+                    int col = Math.Min(_dCol[i], _cols - w);
+                    DrawGlyph(ch, 20, _baseText[1], null, col * _cellW, row * _cellH, w);
+                    Mark(row, col, ch, w);
+                }
+                if (respawn) { SpawnDrop(i); continue; }
+
+                // Bright comet head falling down the column, same treatment as the
+                // ticker heads but with the softer mid-tier bloom.
+                for (int d = 0; d < Ramp; d++)
+                {
+                    int row = _dIdx[i] - 1 - d;
+                    if (row < 0 || row >= _rows) continue;
+                    char ch = txt[Mod(row, L)];
+                    if (ch == ' ') continue;
+                    int w = W(ch);
+                    int col = Math.Min(_dCol[i], _cols - w);
+                    _g.FillRectangle(Brushes.Black, col * _cellW, row * _cellH, w * _cellW, _cellH);
+                    char show = (_decode && d < Scramble) ? ScrambleGlyph(w) : ch;
+                    DrawGlyph(show, 20 + 2 + d, _rampText[1][d], d == 0 ? _glowMid : null,
+                              col * _cellW, row * _cellH, w);
+                }
+            }
+        }
+
+        // The time CONVERGES out of the rain. Once a minute HH:MM is rasterized from
+        // a real font into a per-CELL ink-coverage mask (so the digits are font-smooth,
+        // not blocky dot-matrix). While the clock is up, whatever characters the rain
+        // has already left inside that mask re-illuminate brighter — live tickers and
+        // falling columns keep writing through it, so the digits shimmer with real
+        // content — and gaps fill with fresh glyphs. The fade then melts it back in.
         void DrawClock(DateTime now, double sec)
         {
-            // Grid cells are much taller than wide, so a square-looking dot spans
-            // several columns but one row. Scale the whole face to ~half the width
-            // without letting it dominate vertically.
-            int dotW = Math.Max(1, (int)Math.Round(_cellH / (double)_cellW));
-            int scale = Math.Max(1, (int)Math.Round(_cols * 0.55 / (26.0 * dotW)));
-            while (scale > 1 && 7 * scale > _rows / 2) scale--;
-            int cw = dotW * scale;                           // cells per dot, horizontal
-            int gw = 26 * cw, gh = 7 * scale;                // grid footprint in cells
-            int c0 = (_cols - gw) / 2, r0 = (_rows - gh) / 2;
-            if (c0 < 0 || r0 < 0) return;                    // pane too small (preview)
-
-            if (now.Minute != _clockMinute || _clockCells == null || _clockCells.Length != gw * gh)
+            if (now.Minute != _clockMinute)
             {
                 _clockMinute = now.Minute;
-                if (_clockCells == null || _clockCells.Length != gw * gh)
-                    _clockCells = new char[gw * gh];
-                for (int i = 0; i < _clockCells.Length; i++) _clockCells[i] = Gib();
+                BuildClockMask(now.ToString("HH:mm"));
             }
+            if (_ckMask == null) return;
 
-            // The plate re-tints every frame, converging to near-black behind the
-            // digits while the clock is up, then fading out with everything else.
-            _g.FillRectangle(_clockPlate, (c0 - 2) * _cellW, (r0 - 1) * _cellH,
-                             (gw + 4) * _cellW, (gh + 2) * _cellH);
+            // A gentle plate dims the rain around the digits so the bright pattern
+            // reads clearly; it converges over a few frames and fades out with the rest.
+            _g.FillRectangle(_clockPlate, (_ckC0 - 1) * _cellW, (_ckR0 - 1) * _cellH,
+                             (_ckGw + 2) * _cellW, (_ckGh + 2) * _cellH);
 
-            string t = now.ToString("HH:mm");
-            double reveal = sec < 0.9 ? sec / 0.9 : 1.0;
-            int shimmer = reveal < 1.0 ? 20 : 5;             // % of cells re-rolled per frame
-            int cx = 0;
-            for (int i = 0; i < t.Length; i++)
-            {
-                string[] shape = t[i] == ':' ? ColonShape : DigitShapes[t[i] - '0'];
-                int dw = shape[0].Length;
-                for (int dr = 0; dr < 7; dr++)
-                    for (int dc = 0; dc < dw; dc++)
+            double reveal = sec < 1.5 ? sec / 1.5 : 1.0;
+            for (int cr = 0; cr < _ckGh; cr++)
+                for (int cc = 0; cc < _ckGw; cc++)
+                {
+                    int mi = cr * _ckGw + cc;
+                    int m = _ckMask[mi];
+                    if (m < 90) continue;                    // no ink at this cell
+
+                    // Deterministic scatter: each cell converges at its own moment.
+                    uint hsh = (uint)((cc * 73856093) ^ (cr * 19349663) ^ (_clockMinute * 83492791));
+                    if (reveal < 1.0 && (hsh % 997) / 997.0 > reveal) continue;
+
+                    // Re-illuminate whatever character the rain left here; brand-new
+                    // glyphs only where the cell is empty.
+                    int gcol = _ckC0 + cc, grow = _ckR0 + cr;
+                    int at = gcol;
+                    char ch = _scr[grow * _cols + gcol];
+                    if (ch == '\x01' && gcol > 0) { at = gcol - 1; ch = _scr[grow * _cols + at]; }
+                    if (ch <= ' ')
                     {
-                        if (shape[dr][dc] != '#') continue;
-                        // Deterministic scatter: each dot pops in at its own moment.
-                        uint hsh = (uint)(((cx + dc) * 73856093) ^ (dr * 19349663) ^ (now.Minute * 83492791));
-                        if (reveal < 1.0 && (hsh % 997) / 997.0 > reveal) continue;
-
-                        // Erase the rain behind the dot so the digit stays crisp.
-                        _g.FillRectangle(Brushes.Black, (c0 + (cx + dc) * cw) * _cellW,
-                                         (r0 + dr * scale) * _cellH, cw * _cellW, scale * _cellH);
-                        for (int sy = 0; sy < scale; sy++)
-                            for (int sx = 0; sx < cw; sx++)
-                            {
-                                int col = (cx + dc) * cw + sx;
-                                int row = dr * scale + sy;
-                                int ci = row * gw + col;
-                                if (_rng.Next(100) < shimmer) _clockCells[ci] = Gib();
-                                DrawGlyph(_clockCells[ci], StyleClock, _clockText, _glow,
-                                          (c0 + col) * _cellW, (r0 + row) * _cellH, 1);
-                            }
+                        if (_ckFill[mi] == '\0' || _rng.Next(100) < 5) _ckFill[mi] = Gib();
+                        ch = _ckFill[mi];
+                        at = gcol;
                     }
-                cx += dw + 1;
+                    int w = IsWide(ch) ? 2 : 1;
+                    if (at + w > _cols) at = _cols - w;
+
+                    bool core = m > 160;                     // solid ink vs anti-aliased edge
+                    DrawGlyph(ch, core ? StyleClock : StyleClockDim,
+                              core ? _clockText : _clockEdge, core ? _glow : null,
+                              at * _cellW, grow * _cellH, w);
+                }
+        }
+
+        // Rasterize HH:MM into a small bitmap and sample it per grid cell, producing
+        // the ink-coverage mask the convergence draws from.
+        void BuildClockMask(string t)
+        {
+            _ckMask = null;
+            int gh = Math.Max(8, Math.Min((int)(_rows * 0.40), 22));
+            float px = gh * _cellH * 0.95f;
+            var sf = StringFormat.GenericTypographic;
+            // A heavy face for the mask only (the pixels drawn are still rain glyphs):
+            // thick strokes must span several grid cells or the digits crumble.
+            Font f = ClockFont(px);
+            try
+            {
+                SizeF sz = _g.MeasureString(t, f, PointF.Empty, sf);
+                float maxW = _cols * _cellW * 0.80f;
+                if (sz.Width > maxW)
+                {
+                    float k = maxW / sz.Width;
+                    f.Dispose();
+                    px *= k;
+                    gh = Math.Max(8, (int)(gh * k));
+                    f = ClockFont(px);
+                    sz = _g.MeasureString(t, f, PointF.Empty, sf);
+                }
+                int gw = Math.Min(_cols - 2, (int)Math.Ceiling(sz.Width / _cellW) + 1);
+                _ckGw = gw; _ckGh = gh;
+                _ckC0 = (_cols - gw) / 2;
+                _ckR0 = (_rows - gh) / 2;
+                if (_ckC0 < 1 || _ckR0 < 1 || gw < 5) return;   // pane too small (preview)
+
+                using (var bmp = new Bitmap(gw * _cellW, gh * _cellH, PixelFormat.Format32bppRgb))
+                using (var bg = Graphics.FromImage(bmp))
+                {
+                    bg.Clear(Color.Black);
+                    bg.TextRenderingHint = TextRenderingHint.AntiAlias;
+                    bg.DrawString(t, f, Brushes.White,
+                                  (bmp.Width - sz.Width) * 0.5f, (bmp.Height - sz.Height) * 0.5f, sf);
+
+                    _ckMask = new byte[gw * gh];
+                    _ckFill = new char[gw * gh];
+                    for (int cr = 0; cr < gh; cr++)
+                        for (int cc = 0; cc < gw; cc++)
+                        {
+                            int x0 = cc * _cellW, y0 = cr * _cellH;
+                            int a = bmp.GetPixel(x0 + _cellW / 4, y0 + _cellH / 4).R
+                                  + bmp.GetPixel(x0 + (3 * _cellW) / 4, y0 + _cellH / 4).R
+                                  + bmp.GetPixel(x0 + _cellW / 4, y0 + (3 * _cellH) / 4).R
+                                  + bmp.GetPixel(x0 + (3 * _cellW) / 4, y0 + (3 * _cellH) / 4).R;
+                            _ckMask[cr * gw + cc] = (byte)(a / 4);
+                        }
+                }
             }
+            finally { f.Dispose(); }
+        }
+
+        Font ClockFont(float px)
+        {
+            try { return new Font("Arial", px, FontStyle.Bold, GraphicsUnit.Pixel); }
+            catch { return new Font(_font.FontFamily, px, FontStyle.Bold, GraphicsUnit.Pixel); }
         }
 
         public void Prewarm(int frames) { for (int i = 0; i < frames; i++) Step(); }
@@ -889,8 +1094,8 @@ namespace MatrixSaver
             _fade.Dispose();
             _glow.Dispose();
             _glowMid.Dispose();
-            _dust.Dispose();
             _clockText.Dispose();
+            _clockEdge.Dispose();
             _clockPlate.Dispose();
             for (int tier = 0; tier < Tiers; tier++)
             {
@@ -1201,7 +1406,7 @@ namespace MatrixSaver
             _decode.Checked = Settings.Decode;
             Controls.Add(_decode);
 
-            _clock.Text = "Clock: HH:MM materializes out of the rain each minute.";
+            _clock.Text = "Clock: the rain converges into HH:MM each minute.";
             _clock.Location = new Point(12, 380);
             _clock.AutoSize = true;
             _clock.Checked = Settings.Clock;
