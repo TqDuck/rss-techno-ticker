@@ -497,6 +497,10 @@ namespace MatrixSaver
         int _dropN;
         int[] _dCol; double[] _dPos, _dSpd; int[] _dIdx; string[] _dTxt;
 
+        // National-debt risers: figures climbing bottom-to-top on the mid grid.
+        int _riseN, _riseNext;
+        int[] _uCol; double[] _uPos, _uSpd, _uHold; int[] _uIdx; string[] _uTxt;
+
         readonly SolidBrush _fade = new SolidBrush(Color.FromArgb(12, 0, 0, 0));
         readonly SolidBrush _glow;                                     // baked head bloom (near)
         readonly SolidBrush _glowMid;                                  // softer bloom (mid tier)
@@ -627,6 +631,16 @@ namespace MatrixSaver
                 _dPos[i] = -_rng.NextDouble() * _rowsT[1] * 2;
                 _dIdx[i] = (int)Math.Floor(_dPos[i]);
             }
+
+            _riseN = Math.Min(Debts.Length, Math.Max(4, _colsT[1] / 24));
+            _uCol = new int[_riseN];
+            _uPos = new double[_riseN];
+            _uSpd = new double[_riseN];
+            _uHold = new double[_riseN];
+            _uIdx = new int[_riseN];
+            _uTxt = new string[_riseN];
+            _riseNext = _rng.Next(Debts.Length);
+            for (int i = 0; i < _riseN; i++) SpawnRiser(i);
         }
 
         public void SetPool(List<string> pool)
@@ -732,6 +746,105 @@ namespace MatrixSaver
             return sym[_rng.Next(sym.Length)];
         }
 
+        // ---- National debt data ----
+        // Gross general-government debt in LOCAL currency: ballpark IMF WEO /
+        // national-treasury estimates pinned to DebtEpoch, extrapolated per second
+        // from each nation's borrowing pace — so the figures are genuinely being
+        // calculated as they climb. The currency sign leads, and the digits are
+        // grouped the way that nation writes them.
+        class DebtInfo
+        {
+            public readonly string Sign;
+            public readonly double Base, PerYear;
+            public readonly byte Fmt;
+            public DebtInfo(string sign, double baseAmt, double perYear, byte fmt)
+            { Sign = sign; Base = baseAmt; PerYear = perYear; Fmt = fmt; }
+        }
+        const byte FmtComma = 0, FmtDot = 1, FmtSpace = 2, FmtApos = 3, FmtIndian = 4, FmtArabic = 5;
+        static readonly DateTime DebtEpoch = new DateTime(2026, 1, 1);
+        static readonly DebtInfo[] Debts =
+        {
+            new DebtInfo("$",    38.3e12, 2.1e12,  FmtComma),   // United States
+            new DebtInfo("¥",    1355e12, 12e12,   FmtComma),   // Japan (half-width yen)
+            new DebtInfo("￥",   1.24e14, 1.3e13,  FmtComma),   // China (full-width yuan)
+            new DebtInfo("€",    2.78e12, 9e10,    FmtDot),     // Germany
+            new DebtInfo("€",    3.45e12, 1.3e11,  FmtSpace),   // France
+            new DebtInfo("€",    3.05e12, 8e10,    FmtDot),     // Italy
+            new DebtInfo("€",    1.66e12, 5e10,    FmtDot),     // Spain
+            new DebtInfo("£",    2.95e12, 1.4e11,  FmtComma),   // United Kingdom
+            new DebtInfo("₹",    1.98e14, 1.6e13,  FmtIndian),  // India (lakh/crore)
+            new DebtInfo("R$",   9.6e12,  8e11,    FmtDot),     // Brazil
+            new DebtInfo("$",    2.35e12, 7e10,    FmtComma),   // Canada
+            new DebtInfo("$",    1.02e12, 5e10,    FmtComma),   // Australia
+            new DebtInfo("₩",    1.26e15, 9e13,    FmtComma),   // South Korea
+            new DebtInfo("₽",    3.2e13,  4e12,    FmtSpace),   // Russia
+            new DebtInfo("$",    1.75e13, 1.4e12,  FmtComma),   // Mexico
+            new DebtInfo("Rp",   8.9e15,  6e14,    FmtDot),     // Indonesia
+            new DebtInfo("₺",    1.25e13, 3.5e12,  FmtDot),     // Turkey
+            new DebtInfo("﷼",   1.35e12, 1.3e11,  FmtArabic),  // Saudi Arabia (Arabic-Indic digits)
+            new DebtInfo("Fr.",  3.2e11,  5e9,     FmtApos),    // Switzerland
+            new DebtInfo("€",    5.2e11,  1.5e10,  FmtDot),     // Netherlands
+            new DebtInfo("zł",   2.05e12, 2.2e11,  FmtSpace),   // Poland
+            new DebtInfo("kr",   2.25e12, 6e10,    FmtSpace),   // Sweden
+            new DebtInfo("kr",   2.3e12,  7e10,    FmtSpace),   // Norway
+            new DebtInfo("₪",    1.38e12, 9e10,    FmtComma),   // Israel
+            new DebtInfo("$",    6.3e17,  9e16,    FmtDot),     // Argentina
+            new DebtInfo("E£",   1.55e13, 2.5e12,  FmtComma),   // Egypt
+            new DebtInfo("฿",    1.25e13, 7e11,    FmtComma),   // Thailand
+            new DebtInfo("₫",    4.6e15,  4e14,    FmtDot),     // Vietnam
+            new DebtInfo("€",    3.72e11, 4e9,     FmtDot),     // Greece
+            new DebtInfo("R",    6.1e12,  5.5e11,  FmtSpace),   // South Africa
+            new DebtInfo("₦",    1.5e14,  2.5e13,  FmtComma),   // Nigeria
+            new DebtInfo("₱",    1.67e13, 1.4e12,  FmtComma),   // Philippines
+            new DebtInfo("₨",    8.1e13,  1.1e13,  FmtIndian),  // Pakistan (lakh/crore)
+            new DebtInfo("₴",    7.6e12,  1.4e12,  FmtSpace),   // Ukraine
+        };
+
+        static string FormatDebt(DebtInfo d)
+        {
+            double v = d.Base + d.PerYear * (DateTime.Now - DebtEpoch).TotalSeconds / 31557600.0;
+            string digits = decimal.Truncate((decimal)Math.Max(0.0, v)).ToString();
+            var sb = new StringBuilder(d.Sign);
+            switch (d.Fmt)
+            {
+                case FmtIndian:
+                    // Lakh/crore grouping: last three digits, then pairs (1,23,45,678).
+                    int e = digits.Length;
+                    var g = new List<string>();
+                    g.Add(digits.Substring(Math.Max(0, e - 3)));
+                    e -= 3;
+                    while (e > 0)
+                    {
+                        int s2 = Math.Max(0, e - 2);
+                        g.Insert(0, digits.Substring(s2, e - s2));
+                        e = s2;
+                    }
+                    sb.Append(string.Join(",", g.ToArray()));
+                    break;
+                case FmtArabic:
+                    foreach (char c in Group3(digits, '٬'))   // ٬ Arabic thousands mark
+                        sb.Append(c >= '0' && c <= '9' ? (char)(0x0660 + (c - '0')) : c);
+                    break;
+                default:
+                    sb.Append(Group3(digits, d.Fmt == FmtDot ? '.'
+                                           : d.Fmt == FmtSpace ? ' '
+                                           : d.Fmt == FmtApos ? '\'' : ','));
+                    break;
+            }
+            return sb.ToString();
+        }
+
+        static string Group3(string digits, char sep)
+        {
+            var sb = new StringBuilder();
+            for (int i = 0; i < digits.Length; i++)
+            {
+                if (i > 0 && (digits.Length - i) % 3 == 0) sb.Append(sep);
+                sb.Append(digits[i]);
+            }
+            return sb.ToString();
+        }
+
         // Gap filler for the RTL layer: Arabic letters instead of katakana, so the
         // far tickers stay visually coherent with their headlines.
         char RtlGib()
@@ -764,6 +877,8 @@ namespace MatrixSaver
         Font FontFor(int tier, char c)
         {
             if (IsRtl(c)) return _fontRTLT[tier];
+            if ((c >= 0x20A0 && c <= 0x20CF) || c == 0x0E3F)   // currency signs (₹₽₺₪₴₦₱₨฿…)
+                return _fontRTLT[tier];                        // Tahoma covers far more of them
             if ((c >= 0xAC00 && c <= 0xD7A3) || (c >= 0x1100 && c <= 0x11FF) ||
                 (c >= 0x3130 && c <= 0x318F)) return _fontKRT[tier];   // Hangul
             return _fontT[tier];
@@ -839,6 +954,7 @@ namespace MatrixSaver
 
             for (int r = 0; r < _rowsT[2]; r++) if (_active[SetF][r]) StepRow(SetF, r, dt);
             StepDrops(dt);
+            StepRisers(dt);
             for (int r = 0; r < _rowsT[0]; r++) if (_active[SetN][r]) StepRow(SetN, r, dt);
 
             if (_clockOn)
@@ -942,6 +1058,66 @@ namespace MatrixSaver
                 for (int k = 0; k < n; k++)
                     sb.Append((char)(0x30A1 + _rng.Next(0, 0x30FA - 0x30A1 + 1)));
                 _dTxt[i] = sb.ToString();
+            }
+        }
+
+        // The debt figures climb bottom-to-top: the currency sign leads at the
+        // bottom and the amount reads upward, most-significant digit last. A fresh
+        // value is computed at every respawn, so the numbers visibly grow.
+        void SpawnRiser(int i)
+        {
+            int cols = _colsT[1];
+            _uTxt[i] = FormatDebt(Debts[Mod(_riseNext++, Debts.Length)]);
+            int lane = Math.Max(1, cols / _riseN);            // stratified so risers spread out
+            _uCol[i] = Math.Min(cols - 2, i * lane + _rng.Next(Math.Max(1, lane - 2)));
+            _uSpd[i] = 0.18 + _rng.NextDouble() * 0.30;
+            _uPos[i] = -(2.0 + _rng.NextDouble() * 45.0);     // delay before entering
+            _uIdx[i] = (int)Math.Floor(_uPos[i]);
+            _uHold[i] = -1.0;
+        }
+
+        void StepRisers(double dt)
+        {
+            int cw = _cwT[1], chh = _chT[1], rows = _rowsT[1], cols = _colsT[1];
+            for (int i = 0; i < _riseN; i++)
+            {
+                string txt = _uTxt[i];
+                int L = txt.Length;
+                if (_uHold[i] >= 0.0)
+                {
+                    // Fully written: hold the figure crisp for a few seconds, then
+                    // respawn as the next nation (with a freshly calculated value).
+                    _uHold[i] -= dt;
+                    if (_uHold[i] < 0.0) { SpawnRiser(i); continue; }
+                }
+                else
+                {
+                    _uPos[i] += _uSpd[i] * dt;
+                    int target = (int)Math.Floor(_uPos[i]);
+                    if (target > _uIdx[i]) _uIdx[i] = Math.Min(target, L);
+                    if (_uIdx[i] >= L || _uIdx[i] > rows) _uHold[i] = 100.0;
+                }
+
+                // Redraw the whole written portion every frame so the figure stays
+                // readable against the fade until it respawns and melts away.
+                int written = Math.Min(_uIdx[i], Math.Min(L, rows));
+                bool done = _uHold[i] >= 0.0;
+                for (int k = 0; k < written; k++)
+                {
+                    int row = rows - 1 - k;
+                    char ch = txt[k];
+                    if (ch == ' ') continue;                  // grouping gap (space-format nations)
+                    int w = W(ch);
+                    int col = Math.Min(_uCol[i], cols - w);
+                    _g.FillRectangle(Brushes.Black, col * cw, row * chh, w * cw, chh);
+                    int age = written - 1 - k;                // 0 = newest placement
+                    bool fresh = !done && age < Ramp;
+                    char show = (fresh && _decode && age < Scramble) ? ScrambleGlyph(w) : ch;
+                    Brush b = fresh ? _rampText[1][age] : _rampText[1][2];
+                    int style = 20 + 2 + (fresh ? age : 2);
+                    Brush halo = fresh && age == 0 ? _glowMid : null;
+                    DrawGlyph(1, show, style, b, halo, col * cw, row * chh, w);
+                }
             }
         }
 

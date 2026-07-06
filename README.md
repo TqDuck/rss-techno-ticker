@@ -41,6 +41,15 @@ glyphs take two cells):
 - **Real perspective** — each layer renders at its own type size (mid ≈ 2/3,
   far ≈ 1/2 of the foreground) on its own grid, darker with distance, so the
   back layers actually sit farther away instead of being dimmer copies.
+- **National debt risers** — the gross government debt of 34 nations climbs
+  **bottom-to-top** through the mid layer, currency sign leading, each figure
+  live-extrapolated per second from that nation's borrowing pace (the US ticks
+  up ~$67,000 every second) and grouped the way that nation writes numbers:
+  `€2.825.993.284.134` German-style, `€3 516 434 743 749` French-style,
+  `₹20,61,76,58,38,46,044` in lakh/crore, `Fr.322'555'182'452` Swiss,
+  `﷼١٬٤١٦٬٤٣٤٬٧٤٣٬٧٥٣` in Arabic-Indic numerals, half-width `¥` for Japan
+  vs full-width `￥` for China. A written figure holds crisp for a few
+  seconds, then melts into the fade and the next nation rises.
 - **Phosphor bloom** — foreground heads radiate a three-ring baked-in glow halo,
   the falling columns a softer one (free at runtime — it lives in the glyph cache).
 - **The rain converges into a clock** — at the top of each minute the characters
@@ -116,6 +125,8 @@ copy the file to a `.exe` name and invoke that directly.
   `sizes` table, and the 0.55/0.90 row-activation odds in the constructor;
   **bloom strength** — the `_glow` / `_glowMid` alphas; **vertical column
   density** — `_dropN` (default one drop per 5 mid-grid columns).
+- **Debt figures** — the `Debts` table (sign, base amount pinned to `DebtEpoch`,
+  growth per year, regional grouping style); **riser count** — `_riseN`.
 - **Clock size** — the `_rows * 0.40` height and `0.80` width caps in
   `BuildClockMask`; **legibility thresholds** — the `90`/`160` ink cutoffs.
 - **Sweep speed** — the `_speed[r]` ranges in the constructor.
