@@ -498,8 +498,13 @@ namespace MatrixSaver
         int[] _dCol; double[] _dPos, _dSpd; int[] _dIdx; string[] _dTxt;
 
         // National-debt risers: figures climbing bottom-to-top on the mid grid.
+        // Each riser crosses the WHOLE screen; the figure repeats up the column,
+        // recomputed at every repetition so successive passes carry the number
+        // the nation's debt clock has already counted up to.
+        const int RiserWindow = 34;      // rows kept crisp behind the head
         int _riseN, _riseNext;
-        int[] _uCol; double[] _uPos, _uSpd, _uHold; int[] _uIdx; string[] _uTxt;
+        int[] _uCol; double[] _uPos, _uSpd; int[] _uIdx, _uNat, _uOff;
+        string[] _uTxt; char[][] _uCh;   // per-row committed chars for the refresh window
 
         readonly SolidBrush _fade = new SolidBrush(Color.FromArgb(12, 0, 0, 0));
         readonly SolidBrush _glow;                                     // baked head bloom (near)
@@ -636,9 +641,11 @@ namespace MatrixSaver
             _uCol = new int[_riseN];
             _uPos = new double[_riseN];
             _uSpd = new double[_riseN];
-            _uHold = new double[_riseN];
             _uIdx = new int[_riseN];
+            _uNat = new int[_riseN];
+            _uOff = new int[_riseN];
             _uTxt = new string[_riseN];
+            _uCh = new char[_riseN][];
             _riseNext = _rng.Next(Debts.Length);
             for (int i = 0; i < _riseN; i++) SpawnRiser(i);
         }
@@ -1062,18 +1069,19 @@ namespace MatrixSaver
         }
 
         // The debt figures climb bottom-to-top: the currency sign leads at the
-        // bottom and the amount reads upward, most-significant digit last. A fresh
-        // value is computed at every respawn, so the numbers visibly grow.
+        // bottom and the amount reads upward, most-significant digit last.
         void SpawnRiser(int i)
         {
             int cols = _colsT[1];
-            _uTxt[i] = FormatDebt(Debts[Mod(_riseNext++, Debts.Length)]);
+            _uNat[i] = Mod(_riseNext++, Debts.Length);
+            _uTxt[i] = FormatDebt(Debts[_uNat[i]]) + "  ";
+            _uOff[i] = 0;
             int lane = Math.Max(1, cols / _riseN);            // stratified so risers spread out
             _uCol[i] = Math.Min(cols - 2, i * lane + _rng.Next(Math.Max(1, lane - 2)));
-            _uSpd[i] = 0.18 + _rng.NextDouble() * 0.30;
+            _uSpd[i] = 0.25 + _rng.NextDouble() * 0.30;
             _uPos[i] = -(2.0 + _rng.NextDouble() * 45.0);     // delay before entering
             _uIdx[i] = (int)Math.Floor(_uPos[i]);
-            _uHold[i] = -1.0;
+            if (_uCh[i] == null || _uCh[i].Length != _rowsT[1]) _uCh[i] = new char[_rowsT[1]];
         }
 
         void StepRisers(double dt)
@@ -1081,37 +1089,42 @@ namespace MatrixSaver
             int cw = _cwT[1], chh = _chT[1], rows = _rowsT[1], cols = _colsT[1];
             for (int i = 0; i < _riseN; i++)
             {
-                string txt = _uTxt[i];
-                int L = txt.Length;
-                if (_uHold[i] >= 0.0)
+                _uPos[i] += _uSpd[i] * dt;
+                int target = (int)Math.Floor(_uPos[i]);
+                bool offTop = false;
+                while (_uIdx[i] < target)
                 {
-                    // Fully written: hold the figure crisp for a few seconds, then
-                    // respawn as the next nation (with a freshly calculated value).
-                    _uHold[i] -= dt;
-                    if (_uHold[i] < 0.0) { SpawnRiser(i); continue; }
+                    int k = _uIdx[i]++;
+                    if (k < 0) continue;
+                    if (k >= rows) { offTop = true; break; }
+                    // The figure repeats up the column, and every repetition re-reads
+                    // the debt clock — by the time one pass finishes rendering, the
+                    // number has already moved, so the next pass renders the new one.
+                    if (_uOff[i] >= _uTxt[i].Length)
+                    {
+                        _uTxt[i] = FormatDebt(Debts[_uNat[i]]) + "  ";
+                        _uOff[i] = 0;
+                    }
+                    _uCh[i][rows - 1 - k] = _uTxt[i][_uOff[i]++];
                 }
-                else
-                {
-                    _uPos[i] += _uSpd[i] * dt;
-                    int target = (int)Math.Floor(_uPos[i]);
-                    if (target > _uIdx[i]) _uIdx[i] = Math.Min(target, L);
-                    if (_uIdx[i] >= L || _uIdx[i] > rows) _uHold[i] = 100.0;
-                }
+                // The head crossed the whole screen: hand the column to the fade and
+                // start the next nation from the bottom in a fresh lane.
+                if (offTop) { SpawnRiser(i); continue; }
 
-                // Redraw the whole written portion every frame so the figure stays
-                // readable against the fade until it respawns and melts away.
-                int written = Math.Min(_uIdx[i], Math.Min(L, rows));
-                bool done = _uHold[i] >= 0.0;
-                for (int k = 0; k < written; k++)
+                // Keep the most recent stretch crisp against the fade; the older
+                // repetitions below dissolve back into the rain.
+                int head = Math.Min(_uIdx[i], rows);
+                if (head <= 0) continue;
+                for (int k = Math.Max(0, head - RiserWindow); k < head; k++)
                 {
                     int row = rows - 1 - k;
-                    char ch = txt[k];
-                    if (ch == ' ') continue;                  // grouping gap (space-format nations)
+                    char ch = _uCh[i][row];
+                    if (ch == '\0' || ch == ' ') continue;    // grouping gap
                     int w = W(ch);
                     int col = Math.Min(_uCol[i], cols - w);
                     _g.FillRectangle(Brushes.Black, col * cw, row * chh, w * cw, chh);
-                    int age = written - 1 - k;                // 0 = newest placement
-                    bool fresh = !done && age < Ramp;
+                    int age = head - 1 - k;                   // 0 = newest placement
+                    bool fresh = age < Ramp;
                     char show = (fresh && _decode && age < Scramble) ? ScrambleGlyph(w) : ch;
                     Brush b = fresh ? _rampText[1][age] : _rampText[1][2];
                     int style = 20 + 2 + (fresh ? age : 2);

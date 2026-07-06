@@ -48,8 +48,12 @@ glyphs take two cells):
   `€2.825.993.284.134` German-style, `€3 516 434 743 749` French-style,
   `₹20,61,76,58,38,46,044` in lakh/crore, `Fr.322'555'182'452` Swiss,
   `﷼١٬٤١٦٬٤٣٤٬٧٤٣٬٧٥٣` in Arabic-Indic numerals, half-width `¥` for Japan
-  vs full-width `￥` for China. A written figure holds crisp for a few
-  seconds, then melts into the fade and the next nation rises.
+  vs full-width `￥` for China. Each riser crosses the **whole screen** bottom
+  to top, and the figure repeats up the column — every repetition re-reads the
+  debt clock, so by the time one pass has rendered, the number has already
+  moved and the next pass shows the new value. Behind the head the recent
+  stretch stays crisp; older passes dissolve back into the rain, and at the
+  top edge the next nation takes over from the bottom.
 - **Phosphor bloom** — foreground heads radiate a three-ring baked-in glow halo,
   the falling columns a softer one (free at runtime — it lives in the glyph cache).
 - **The rain converges into a clock** — at the top of each minute the characters
