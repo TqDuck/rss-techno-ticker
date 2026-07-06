@@ -31,13 +31,14 @@ glyphs take two cells):
 - **Five color themes** — Matrix Green, Amber CRT, Ice Blue, Ghost White, Crimson.
 - **Decode effect** — each new character flickers through random glyphs for a few
   frames before resolving into the real letter (toggleable).
-- **Depth layers** — three tiers of rows: bright fast foreground, mid-ground, and
-  dim slow background rain, for a layered parallax feel.
-- **Phosphor bloom** — foreground heads carry a soft baked-in glow halo (free at
-  runtime — it lives in the glyph cache).
-- **A clock in the rain** — at the top of each minute, HH:MM scramble-decodes at
-  screen centre, glows in the theme colour for a few seconds, then dissolves back
-  into the fade (toggleable).
+- **Depth layers** — three tiers of rows (bright fast foreground, mid-ground, dim
+  slow background), long luminous trails, and a faint ambient dust of glyphs
+  twinkling in the dark between tickers, for a dense layered-parallax feel.
+- **Phosphor bloom** — foreground heads radiate a three-ring baked-in glow halo,
+  mid-tier heads a softer one (free at runtime — it lives in the glyph cache).
+- **A clock made of rain** — at the top of each minute, HH:MM assembles at screen
+  centre as dot-matrix digits whose every dot is a shimmering katakana glyph;
+  it glows for a few seconds, then dissolves back into the fade (toggleable).
 - **Settings dialog** — add/remove feed URLs, **Test all** to health-check every
   feed (item count or the exact failure), cap or uncap description length,
   toggle the katakana filler, pick a theme, toggle the decode effect and the
@@ -105,7 +106,8 @@ copy the file to a `.exe` name and invoke that directly.
 - **Trail length** — the alpha of `_fade` (lower = longer-lived text).
 - **Head ramp length** — the `Ramp` constant; **shimmer duration** — `Scramble`.
 - **Depth** — the `TierDim` table (how dark each tier is) and the 40/30/30 tier
-  split in the constructor; **bloom strength** — the `_glow` alpha.
+  split in the constructor; **bloom strength** — the `_glow` / `_glowMid` alphas;
+  **dust density** — the `specks` count in `Step`.
 - **Sweep speed** — the `_speed[r]` ranges in the constructor.
 - **Text size** — `fontSize` in `MatrixForm.OnLoad` (18 full-screen, 11 preview).
 
